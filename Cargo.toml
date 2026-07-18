@@ -24,6 +24,18 @@ log = "0.4"
 windows-capture = "2"
 raw-window-handle = "0.6"
 tray-icon = "0.19"
+# zero-copy capture path: D3D11 (capture) -> shared textures -> D3D12 (wgpu).
+# windows must match windows-capture's version so the COM types line up.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+] }
+# same crate wgpu-hal uses to wrap raw D3D12 resources
+d3d12 = "0.20"
 
 # macOS support is structurally complete but UNTESTED - no Mac in the dev
 # loop. It is kept type-checked via `cargo check --target aarch64-apple-darwin`

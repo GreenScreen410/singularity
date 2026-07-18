@@ -23,15 +23,28 @@ mod capture;
 #[cfg(target_os = "macos")]
 #[path = "capture_macos.rs"]
 mod capture;
+#[cfg(windows)]
+mod gpu_share;
 
-// Platform-neutral shared frame buffer, filled by the capture thread (Windows)
-// and read by the render loop. Stays empty on non-Windows -> test pattern.
+/// Number of shared GPU textures in the zero-copy ring (Windows).
+pub const GPU_BUFFERS: usize = 3;
+
+// Platform-neutral shared frame state, filled by the capture thread and read
+// by the render loop. Two delivery modes: CPU (data holds the frame bytes)
+// and, on Windows, zero-copy GPU (gpu_index names a shared texture instead).
 #[derive(Default)]
 pub struct SharedFrame {
-    pub data: Vec<u8>, // BGRA8, width*height*4, tightly packed
+    pub data: Vec<u8>, // BGRA8, width*height*4, tightly packed (CPU mode)
     pub width: u32,
     pub height: u32,
     pub version: u64,
+    /// Some(i): the newest frame lives in shared GPU texture i, not in data
+    pub gpu_index: Option<usize>,
+    /// NT handles for the shared textures, set by the render side once ready
+    pub gpu_handles: Option<[isize; GPU_BUFFERS]>,
+    pub gpu_size: (u32, u32),
+    /// either side sets this on failure -> both stay on the CPU path
+    pub gpu_disabled: bool,
 }
 pub type Shared = Arc<Mutex<SharedFrame>>;
 
@@ -175,14 +188,31 @@ struct State {
     fps: u32,          // 0 = uncapped (vsync only)
     idle_minutes: f32, // 0 = always visible; >0 = appear after this much idle
     appear_start: Option<std::time::Instant>, // grow-in animation anchor
+    // zero-copy capture path (Windows): shared textures + their bind groups
+    #[cfg(windows)]
+    gpu_share: Option<gpu_share::GpuShare>,
+    #[cfg(windows)]
+    gpu_bind_groups: Vec<wgpu::BindGroup>,
+    #[cfg(windows)]
+    gpu_attempted: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    gpu_current: Option<usize>,
 }
 
 impl State {
     async fn new(window: Arc<Window>, shared: Shared) -> State {
         let size = window.inner_size();
 
+        // Windows must be DX12 (the zero-copy capture path shares D3D12
+        // textures); macOS is Metal; elsewhere let Vulkan/GL race.
+        #[cfg(windows)]
+        let backends = wgpu::Backends::DX12;
+        #[cfg(target_os = "macos")]
+        let backends = wgpu::Backends::METAL;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
+            backends,
             ..Default::default()
         });
         let surface = instance.create_surface(window.clone()).unwrap();
@@ -337,6 +367,60 @@ impl State {
             fps: 0,
             idle_minutes: 0.0,
             appear_start: None,
+            #[cfg(windows)]
+            gpu_share: None,
+            #[cfg(windows)]
+            gpu_bind_groups: Vec::new(),
+            #[cfg(windows)]
+            gpu_attempted: false,
+            gpu_current: None,
+        }
+    }
+
+    /// One-shot attempt to set up the zero-copy path once the capture size is
+    /// known. On failure the capture thread keeps feeding CPU frames.
+    #[cfg(windows)]
+    fn try_setup_gpu_share(&mut self) {
+        if self.gpu_attempted {
+            return;
+        }
+        let (w, h, already, disabled) = {
+            let g = self.shared.lock().unwrap();
+            (g.width, g.height, g.gpu_handles.is_some(), g.gpu_disabled)
+        };
+        if disabled {
+            self.gpu_attempted = true;
+            return;
+        }
+        if already || w == 0 || h == 0 {
+            return; // no frame yet
+        }
+        self.gpu_attempted = true;
+        match gpu_share::create(&self.device, w, h) {
+            Ok(share) => {
+                self.gpu_bind_groups = share
+                    .textures
+                    .iter()
+                    .map(|t| {
+                        make_bind_group(
+                            &self.device,
+                            &self.bind_group_layout,
+                            &self.uniform_buf,
+                            t,
+                            &self.sampler,
+                        )
+                    })
+                    .collect();
+                let mut g = self.shared.lock().unwrap();
+                g.gpu_size = (w, h);
+                g.gpu_handles = Some(share.handles);
+                self.gpu_share = Some(share);
+                eprintln!("render: shared GPU textures ready ({w}x{h})");
+            }
+            Err(e) => {
+                eprintln!("render: GPU sharing unavailable ({e}); using CPU path");
+                self.shared.lock().unwrap().gpu_disabled = true;
+            }
         }
     }
 
@@ -381,17 +465,32 @@ impl State {
     }
 
     fn update(&mut self) {
-        // Pull the latest desktop frame. Copy out of the lock so we don't hold
-        // it during GPU upload. (Extra copy; Stage 4 will remove it.)
+        #[cfg(windows)]
+        self.try_setup_gpu_share();
+
+        // Pull the latest desktop frame. Zero-copy mode just names a shared
+        // GPU texture; CPU mode copies the bytes out of the lock so we don't
+        // hold it during the texture upload.
         let frame = {
             let g = self.shared.lock().unwrap();
             if g.version != self.last_version && g.width > 0 && g.height > 0 {
-                Some((g.width, g.height, g.version, g.data.clone()))
+                self.last_version = g.version;
+                match g.gpu_index {
+                    Some(i) => {
+                        self.gpu_current = Some(i);
+                        self.has_desktop = true;
+                        None
+                    }
+                    None => {
+                        self.gpu_current = None;
+                        Some((g.width, g.height, g.data.clone()))
+                    }
+                }
             } else {
                 None
             }
         };
-        if let Some((w, h, ver, data)) = frame {
+        if let Some((w, h, data)) = frame {
             if (w, h) != self.tex_size {
                 self.desktop_texture = create_desktop_texture(&self.device, w, h);
                 self.bind_group = make_bind_group(
@@ -422,7 +521,6 @@ impl State {
                     depth_or_array_layers: 1,
                 },
             );
-            self.last_version = ver;
             self.has_desktop = true;
         }
 
@@ -465,7 +563,20 @@ impl State {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            // zero-copy mode samples the shared texture's bind group directly
+            let bg: &wgpu::BindGroup;
+            #[cfg(windows)]
+            {
+                bg = match self.gpu_current {
+                    Some(i) if i < self.gpu_bind_groups.len() => &self.gpu_bind_groups[i],
+                    _ => &self.bind_group,
+                };
+            }
+            #[cfg(not(windows))]
+            {
+                bg = &self.bind_group;
+            }
+            pass.set_bind_group(0, bg, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit(Some(encoder.finish()));

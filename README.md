@@ -95,10 +95,14 @@ drift and integration budget in `src/singularity.wgsl` (`DRIFT_*`, `N_STEPS`).
 
 ## Performance & battery
 
-A desktop overlay runs a continuous capture + render loop, so on a laptop
-expect noticeably higher power draw while active. Only pixels near the hole
-pay for geodesic integration, but frame-rate capping and idle throttling are
-still on the roadmap - treat it as a plugged-in toy for now.
+Capture is zero-copy on Windows: each desktop frame is GPU-copied straight
+into a shared D3D12 texture that the shader samples, so frames never touch
+the CPU (with an automatic CPU fallback for setups where sharing is not
+available). Only pixels near the hole pay for geodesic integration, frames
+are delivered only when the screen changes, and the tray offers an FPS cap.
+In screensaver mode the renderer is fully idle until the hole appears. It is
+still a continuous visual effect though, so expect some battery cost while
+the hole is on screen.
 
 ## A note on Windows SmartScreen
 
