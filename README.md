@@ -10,17 +10,22 @@ freed from Ghostty and Claude Code.
 
 <!-- ![demo](docs/demo.gif) — drop a screen recording here to show it off -->
 
-## Status — built in stages
+## Features
 
-This is a native Rust + wgpu app, built up incrementally:
-
-- [x] **Stage 1** — wgpu window renders the black-hole shader over a test pattern
-- [ ] **Stage 2** — feed the live desktop (`Windows.Graphics.Capture`) as the lensed background
-- [ ] **Stage 3** — transparent, click-through, topmost overlay + `WDA_EXCLUDEFROMCAPTURE` (exclude our own window from capture)
-- [ ] **Stage 4** — optimize: GPU-shared capture texture, render only near the hole
-
-Right now you can run Stage 1 to see the black hole drift over a checker/gradient
-background.
+- **Real physics** — every pixel near the hole integrates its own null geodesic
+  through the Schwarzschild metric (after Eric Bruneton's black-hole renderer,
+  via [ghostty-blackhole](https://github.com/s0xDk/ghostty-blackhole)): a true
+  shadow, an Einstein ring with mirrored secondary images, and a tilted
+  Keplerian accretion disk whose far side arcs over and under the hole
+- **Blackbody accretion disk** — Shakura–Sunyaev temperature profile,
+  relativistic Doppler shift and beaming, gravitational time dilation
+- **8 looks, switched live** — Inferno, Gargantua, Quasar, M87\* donut, Blazar,
+  Face-on ember, Pure lens, Zen — pick from the tray menu, with a smooth
+  crossfade (the original tuner's presets, exact values)
+- **A real overlay** — fullscreen, always-on-top, click-through; your apps keep
+  working underneath while the hole warps them. The overlay excludes itself
+  from capture, so there is no mirror-feedback
+- **Single self-contained exe** — no runtime, no installer, ~8 MB
 
 ## Build & run
 
@@ -72,17 +77,31 @@ standalone app above is the real goal.
 
 ## How it works
 
-Singularity is a screen-space gravitational-lens approximation, not a full
-geodesic integrator. For each pixel it remaps the sampled background coordinate
-toward the hole — strong near the event horizon, negligible far away — then
-draws a black core, a warm photon ring, and a subtle accretion swirl. The centre
-follows a slow Lissajous path so the hole drifts on its own.
+The desktop is captured into a GPU texture and plays the role of the lensed
+"sky". For each pixel near the hole, the fragment shader integrates a photon
+geodesic in the Schwarzschild metric (leapfrog, adaptive step): rays under the
+critical impact parameter fall in (the shadow), escaping rays are projected
+back onto the sky plane (lensing, Einstein ring, mirrored images), and every
+crossing of the tilted disk plane accumulates blackbody emission shifted by
+the relativistic Doppler factor. Far from the hole an analytic weak-field
+formula takes over with a seamless handoff. The centre follows a slow
+Lissajous path so the hole drifts on its own.
+
+Tuning: disk looks live in `src/main.rs` (`PRESETS`), size in `HOLE_RADIUS`,
+drift and integration budget in `src/singularity.wgsl` (`DRIFT_*`, `N_STEPS`).
 
 ## Performance & battery
 
-A desktop overlay runs a continuous capture + render loop, so on a laptop expect
-noticeably higher power draw while active. Stage 4 keeps this in check by only
-warping the region near the hole and capping the frame rate.
+A desktop overlay runs a continuous capture + render loop, so on a laptop
+expect noticeably higher power draw while active. Only pixels near the hole
+pay for geodesic integration, but frame-rate capping and idle throttling are
+still on the roadmap — treat it as a plugged-in toy for now.
+
+## A note on Windows SmartScreen
+
+Release binaries are not code-signed (certificates are priced for companies,
+not desk toys). The first launch of a downloaded exe may show "Windows
+protected your PC" — click **More info → Run anyway**, or build from source.
 
 ## Credits
 

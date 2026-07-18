@@ -3,6 +3,11 @@ name = "singularity"
 version = "0.1.0"
 edition = "2021"
 description = "A drifting black hole gravitational lens over your desktop"
+license = "MIT"
+repository = "https://github.com/GreenScreen410/singularity"
+
+[build-dependencies]
+winresource = "0.1"
 
 # Versions are pinned to a known-good wgpu 0.20 / winit 0.29 combo.
 # If cargo resolves something incompatible and the build breaks, send me the
