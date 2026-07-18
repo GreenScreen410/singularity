@@ -20,6 +20,21 @@ windows-capture = "2"
 raw-window-handle = "0.6"
 tray-icon = "0.19"
 
+# macOS support is structurally complete but UNTESTED — no Mac in the dev
+# loop. It is kept type-checked via `cargo check --target aarch64-apple-darwin`
+# (the objc2 binding crates are pure Rust declarations, so they type-check on
+# any host; only the final link needs a Mac).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-screen-capture-kit = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+raw-window-handle = "0.6"
+tray-icon = "0.19"
+
 [dev-dependencies]
 naga = { version = "0.20", features = ["wgsl-in"] }
 

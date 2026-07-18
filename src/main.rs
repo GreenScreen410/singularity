@@ -18,6 +18,10 @@ use winit::{
 };
 
 #[cfg(windows)]
+#[path = "capture_windows.rs"]
+mod capture;
+#[cfg(target_os = "macos")]
+#[path = "capture_macos.rs"]
 mod capture;
 
 // Platform-neutral shared frame buffer, filled by the capture thread (Windows)
@@ -250,6 +254,8 @@ impl State {
         out
     }
 
+    // only reachable from the tray menu, which Linux doesn't build
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn set_preset(&mut self, idx: usize) {
         self.look_from = self.current_look();
         self.look_to = PRESETS[idx].1;
@@ -421,8 +427,28 @@ fn exclude_from_capture(window: &Window) {
     }
 }
 
+/// macOS equivalent: NSWindowSharingNone removes the window from all screen
+/// capture (ScreenCaptureKit respects it), preventing self-capture feedback.
+#[cfg(target_os = "macos")]
+fn exclude_from_capture(window: &Window) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+            unsafe {
+                let view = h.ns_view.as_ptr() as *mut AnyObject;
+                let ns_window: *mut AnyObject = msg_send![&*view, window];
+                if !ns_window.is_null() {
+                    let _: () = msg_send![&*ns_window, setSharingType: 0usize]; // NSWindowSharingNone
+                }
+            }
+        }
+    }
+}
+
 /// Programmatic tray icon: a black hole — dark disc with a warm ring.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn tray_icon_rgba(size: u32) -> Vec<u8> {
     let mut px = Vec::with_capacity((size * size * 4) as usize);
     let c = (size as f32 - 1.0) / 2.0;
@@ -449,11 +475,11 @@ fn main() {
 
     let shared: Shared = Arc::new(Mutex::new(SharedFrame::default()));
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     capture::start(shared.clone());
 
-    // ---- tray icon with preset menu (작업표시줄 ^ 영역) ----
-    #[cfg(windows)]
+    // ---- tray icon with preset menu (Windows: 작업표시줄 ^ / macOS: 메뉴바) ----
+    #[cfg(any(windows, target_os = "macos"))]
     let (_tray, preset_items, quit_id) = {
         use tray_icon::{
             menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
@@ -494,7 +520,7 @@ fn main() {
     // Click-through: mouse events fall through to whatever is underneath.
     let _ = window.set_cursor_hittest(false);
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     exclude_from_capture(&window);
 
     let mut state = pollster::block_on(State::new(window.clone(), shared.clone()));
@@ -559,7 +585,7 @@ fn main() {
                     }
                 }
                 // tray menu events arrive on a global channel; poll each tick
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                     if ev.id == quit_id {
                         elwt.exit();

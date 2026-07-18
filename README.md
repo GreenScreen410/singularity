@@ -22,21 +22,44 @@ This is a native Rust + wgpu app, built up incrementally:
 Right now you can run Stage 1 to see the black hole drift over a checker/gradient
 background.
 
-## Build & run (Windows)
+## Build & run
+
+### Windows (primary platform, tested)
 
 Requires [Rust](https://rustup.rs) with the MSVC toolchain (the default on
 Windows) and Windows 10 2004+ / Windows 11.
 
 ```powershell
-cd C:\Users\paulj\singularity   # or wherever you cloned it
 cargo run --release
 ```
 
-A window titled **Singularity** opens with a black hole drifting over the test
-pattern. Resize the window — the hole stays circular and keeps wandering.
+The overlay covers the screen, the hole drifts on its own, and clicks pass
+through to your apps. Switch the disk look from the tray icon (the ^ overflow
+area) — 8 presets from Inferno to Zen. Quit via the tray menu or Esc.
 
-Tuning: edit the `TUNABLES` block near the top of `src/singularity.wgsl`
-(`HORIZON`, `LENS`, `DRIFT_*`, ring/disk brightness), then `cargo run` again.
+Cross-compiling from WSL also works: `rustup target add x86_64-pc-windows-gnu`,
+install `mingw-w64`, then `cargo build --release --target x86_64-pc-windows-gnu`.
+
+### macOS (UNTESTED — help wanted)
+
+The macOS port (ScreenCaptureKit capture + `NSWindowSharingNone` self-exclusion
++ menu-bar presets) is structurally complete and kept type-checked via
+`cargo check --target aarch64-apple-darwin`, but has never run on real
+hardware — there is no Mac in this project's dev loop.
+
+```sh
+cargo run --release   # on a Mac
+```
+
+On first launch, grant **Screen Recording** permission (System Settings →
+Privacy & Security) and relaunch. If you try it, success or failure reports
+are equally welcome as issues.
+
+### Linux
+
+Not yet — neither X11 nor Wayland offers a way to exclude a window from
+capture, so a live overlay feeds back into itself. A wallpaper-warp mode is
+the likely path; contributions welcome.
 
 ## No-build alternative (ShaderGlass)
 
