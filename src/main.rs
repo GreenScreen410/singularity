@@ -3,10 +3,10 @@
 // from capture so we don't feed back into ourselves. Falls back to a test
 // pattern until the first frame.
 //
-// GUI subsystem: no console window. Diagnostics (capture/overlay eprintln)
-// are invisible in normal use; for debugging, temporarily comment this out
-// or check with a debugger - Esc and the tray's Quit both still work.
-#![windows_subsystem = "windows"]
+// GUI subsystem in release: no console window. Debug builds keep the console
+// so capture/overlay/gpu diagnostics are visible - build with plain
+// `cargo build` and run the target/debug exe to troubleshoot.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::{Arc, Mutex};
 use winit::{
@@ -456,12 +456,24 @@ impl State {
     }
 
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
+        // Skip no-op reconfigures: after startup the window is layered (the
+        // capture-exclusion flag does that) and a DX12 swapchain rebuild on a
+        // layered window fails, so only reconfigure when the size really
+        // changed (which for a fullscreen overlay is a display-mode change).
+        if new_size.width > 0
+            && new_size.height > 0
+            && (new_size.width != self.config.width || new_size.height != self.config.height)
+        {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
         }
+    }
+
+    /// Unconditional reconfigure, for surface Lost/Outdated recovery.
+    fn reconfigure(&mut self) {
+        self.surface.configure(&self.device, &self.config);
     }
 
     fn update(&mut self) {
@@ -856,10 +868,15 @@ fn main() {
     // Click-through: mouse events fall through to whatever is underneath.
     let _ = window.set_cursor_hittest(false);
 
+    let mut state = pollster::block_on(State::new(window.clone(), shared.clone()));
+
+    // Capture exclusion must come AFTER the first surface configuration:
+    // SetWindowDisplayAffinity implicitly makes the window layered, and DXGI
+    // refuses to create a flip-model swapchain on a layered window
+    // (0x887A0001). Setting it afterwards is the standard order; exclusion
+    // is a composition-time property and applies immediately.
     #[cfg(any(windows, target_os = "macos"))]
     exclude_from_capture(&window);
-
-    let mut state = pollster::block_on(State::new(window.clone(), shared.clone()));
 
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
@@ -890,8 +907,7 @@ fn main() {
                         match state.render() {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                let s = state.size;
-                                state.resize(s);
+                                state.reconfigure();
                             }
                             Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
                             Err(e) => eprintln!("render error: {e:?}"),
