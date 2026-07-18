@@ -63,12 +63,16 @@ impl GraphicsCaptureApiHandler for Handler {
     }
 }
 
-fn run(cursor: CursorCaptureSettings, shared: Shared) -> Result<(), String> {
+fn run(
+    cursor: CursorCaptureSettings,
+    border: DrawBorderSettings,
+    shared: Shared,
+) -> Result<(), String> {
     let monitor = Monitor::primary().map_err(|e| format!("no primary monitor: {e:?}"))?;
     let settings = Settings::new(
         monitor,
         cursor,
-        DrawBorderSettings::Default,
+        border,
         SecondaryWindowSettings::Default,
         MinimumUpdateIntervalSettings::Default,
         DirtyRegionSettings::Default,
@@ -80,18 +84,36 @@ fn run(cursor: CursorCaptureSettings, shared: Shared) -> Result<(), String> {
 }
 
 /// Spawn a background thread that captures the primary monitor forever.
-/// Prefer excluding the cursor (the real cursor is OS-drawn on top of the
-/// overlay, so a captured copy would show as a lensed ghost near the hole);
-/// fall back to default cursor settings if that fails on this system.
+/// Preferred: cursor excluded (the real cursor is OS-drawn on top of the
+/// overlay, so a captured copy would ghost near the hole) and no yellow
+/// capture-indicator border. Both toggles are unsupported on some older
+/// Windows 10 builds, so fall back progressively if starting fails.
 pub fn start(shared: Shared) {
     std::thread::spawn(move || {
-        eprintln!("capture: starting (cursor excluded)");
-        if let Err(e) = run(CursorCaptureSettings::WithoutCursor, shared.clone()) {
-            eprintln!("capture: WithoutCursor failed: {e}");
-            eprintln!("capture: retrying with default cursor settings");
-            if let Err(e) = run(CursorCaptureSettings::Default, shared) {
-                eprintln!("capture: stopped: {e}");
+        let attempts: [(CursorCaptureSettings, DrawBorderSettings, &str); 3] = [
+            (
+                CursorCaptureSettings::WithoutCursor,
+                DrawBorderSettings::WithoutBorder,
+                "cursor excluded, no border",
+            ),
+            (
+                CursorCaptureSettings::WithoutCursor,
+                DrawBorderSettings::Default,
+                "cursor excluded, default border",
+            ),
+            (
+                CursorCaptureSettings::Default,
+                DrawBorderSettings::Default,
+                "default settings",
+            ),
+        ];
+        for (cursor, border, label) in attempts {
+            eprintln!("capture: starting ({label})");
+            match run(cursor, border, shared.clone()) {
+                Ok(()) => return, // session ran and closed normally
+                Err(e) => eprintln!("capture: {label} failed: {e}"),
             }
         }
+        eprintln!("capture: all attempts failed");
     });
 }
