@@ -1,0 +1,14 @@
+# Rust
+/target
+Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~

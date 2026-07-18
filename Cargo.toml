@@ -1,0 +1,29 @@
+[package]
+name = "singularity"
+version = "0.1.0"
+edition = "2021"
+description = "A drifting black hole gravitational lens over your desktop"
+
+# Versions are pinned to a known-good wgpu 0.20 / winit 0.29 combo.
+# If cargo resolves something incompatible and the build breaks, send me the
+# errors and I'll adjust the APIs.
+[dependencies]
+winit = "0.29"
+wgpu = "0.20"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2"
+raw-window-handle = "0.6"
+tray-icon = "0.19"
+
+[dev-dependencies]
+naga = { version = "0.20", features = ["wgsl-in"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
