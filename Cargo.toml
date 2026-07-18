@@ -9,12 +9,12 @@ repository = "https://github.com/GreenScreen410/singularity"
 [build-dependencies]
 winresource = "0.1"
 
-# Versions are pinned to a known-good wgpu 0.20 / winit 0.29 combo.
+# Versions pinned to a known-good wgpu 23 / winit 0.29 combo.
 # If cargo resolves something incompatible and the build breaks, send me the
-# errors and I'll adjust the APIs.
+# errors, pin the exact versions from Cargo.lock.
 [dependencies]
 winit = "0.29"
-wgpu = "0.20"
+wgpu = "23"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 env_logger = "0.11"
@@ -32,10 +32,15 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Direct3D",
     "Win32_System_Threading",
 ] }
-# same crate wgpu-hal uses to wrap raw D3D12 resources
-d3d12 = "0.20"
+# wgpu-hal 23 speaks windows 0.58; only used to hand resources across the
+# hal boundary (same COM ABI, bridged by raw pointer)
+windows_058 = { package = "windows", version = "0.58", features = [
+    "Win32_Graphics_Direct3D12",
+] }
 
 # macOS support is structurally complete but UNTESTED - no Mac in the dev
 # loop. It is kept type-checked via `cargo check --target aarch64-apple-darwin`
@@ -53,7 +58,7 @@ raw-window-handle = "0.6"
 tray-icon = "0.19"
 
 [dev-dependencies]
-naga = { version = "0.20", features = ["wgsl-in"] }
+naga = { version = "23", features = ["wgsl-in"] }
 
 [profile.release]
 opt-level = 3

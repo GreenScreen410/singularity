@@ -6,6 +6,10 @@
 // open, and wrap the very same resources as wgpu textures so the desktop
 // frame never leaves the GPU. The capture thread GPU-copies each frame into
 // one of these and publishes just the buffer index.
+//
+// Version note: our code and windows-capture use windows 0.62 while wgpu-hal
+// 23 uses windows 0.58. COM pointers have a stable ABI, so the two only meet
+// as raw pointers at the hal boundary (windows_058 below).
 
 use crate::GPU_BUFFERS;
 use windows::core::Interface;
@@ -28,7 +32,7 @@ pub fn create(device: &wgpu::Device, width: u32, height: u32) -> Result<GpuShare
     // Pull the raw ID3D12Device out of wgpu. None => not the DX12 backend.
     let raw = unsafe {
         device.as_hal::<wgpu::hal::api::Dx12, _, _>(|hal| {
-            hal.map(|d| d.raw_device().as_mut_ptr() as *mut std::ffi::c_void)
+            hal.map(|d| windows_058::core::Interface::as_raw(d.raw_device()))
         })
     }
     .flatten()
@@ -82,11 +86,13 @@ pub fn create(device: &wgpu::Device, width: u32, height: u32) -> Result<GpuShare
         *slot = handle.0 as isize;
 
         // Wrap the same resource as a wgpu texture. The clone's reference is
-        // handed over to wgpu-hal (from_raw takes ownership of one ref).
+        // handed to the hal (its windows 0.58 wrapper releases it on drop).
         let ptr = res.clone().into_raw();
+        let hal_res: windows_058::Win32::Graphics::Direct3D12::ID3D12Resource =
+            unsafe { windows_058::core::Interface::from_raw(ptr) };
         let hal_tex = unsafe {
             wgpu::hal::dx12::Device::texture_from_raw(
-                d3d12::ComPtr::from_raw(ptr as *mut _),
+                hal_res,
                 wgpu::TextureFormat::Bgra8UnormSrgb,
                 wgpu::TextureDimension::D2,
                 wgpu::Extent3d {

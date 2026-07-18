@@ -14,7 +14,7 @@ use winit::{
     event::{ElementState, Event, KeyEvent, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
-    window::{Fullscreen, Window, WindowBuilder, WindowLevel},
+    window::{Window, WindowBuilder, WindowLevel},
 };
 
 #[cfg(windows)]
@@ -216,6 +216,36 @@ impl State {
             ..Default::default()
         });
         let surface = instance.create_surface(window.clone()).unwrap();
+        // On hybrid-GPU laptops the capture's D3D11 device lives on the
+        // DEFAULT adapter (usually the iGPU) while HighPerformance would pick
+        // the dGPU, and shared textures cannot cross adapters. Prefer the
+        // wgpu adapter whose LUID matches the default adapter so the
+        // zero-copy path works; fall back to the normal request.
+        #[cfg(windows)]
+        let adapter = {
+            let mut chosen = None;
+            if let Some(luid) = default_adapter_luid() {
+                for a in instance.enumerate_adapters(wgpu::Backends::DX12) {
+                    if adapter_luid(&a) == Some(luid) {
+                        eprintln!("render: using capture-matched adapter: {}", a.get_info().name);
+                        chosen = Some(a);
+                        break;
+                    }
+                }
+            }
+            match chosen {
+                Some(a) => a,
+                None => instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&surface),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .expect("no suitable GPU adapter"),
+            }
+        };
+        #[cfg(not(windows))]
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -318,13 +348,13 @@ impl State {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -336,6 +366,7 @@ impl State {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+            cache: None,
         });
 
         State {
@@ -682,6 +713,38 @@ fn exclude_from_capture(window: &Window) {
     }
 }
 
+/// LUID of the system default adapter: the one D3D11CreateDevice(None) and
+/// therefore the capture uses. (LowPart, HighPart).
+#[cfg(windows)]
+fn default_adapter_luid() -> Option<(u32, i32)> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, IDXGIFactory4, DXGI_CREATE_FACTORY_FLAGS,
+    };
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
+    }
+}
+
+/// LUID of a wgpu adapter (DX12 backend only).
+#[cfg(windows)]
+fn adapter_luid(adapter: &wgpu::Adapter) -> Option<(u32, i32)> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+    unsafe {
+        adapter.as_hal::<wgpu::hal::api::Dx12, _, _>(|hal| {
+            let hal = hal?;
+            // hal's adapter is a windows 0.58 wrapper; bridge via raw pointer
+            let raw = windows_058::core::Interface::as_raw(&**hal.raw_adapter());
+            let a = IDXGIAdapter::from_raw_borrowed(&raw)?;
+            let desc = a.GetDesc().ok()?;
+            Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
+        })
+    }
+}
+
 /// Seconds since the last system-wide keyboard/mouse input, like a
 /// screensaver would measure it.
 #[cfg(windows)]
@@ -854,27 +917,39 @@ fn main() {
     let mut boot_warned = false;
 
     let event_loop = EventLoop::new().unwrap();
+    // Manual borderless "fullscreen": an undecorated window sized and placed
+    // over the monitor by hand. winit's Fullscreen::Borderless state makes
+    // DXGI swapchain creation fail with DXGI_ERROR_INVALID_CALL (verified by
+    // examples/dx12_probe.rs), while a manually monitor-sized window works.
+    let (mon_size, mon_pos) = event_loop
+        .primary_monitor()
+        .map(|m| (m.size(), m.position()))
+        .unwrap_or((
+            winit::dpi::PhysicalSize::new(1920, 1080),
+            winit::dpi::PhysicalPosition::new(0, 0),
+        ));
     let window = Arc::new(
         WindowBuilder::new()
             .with_title("Singularity")
             .with_decorations(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_fullscreen(Some(Fullscreen::Borderless(None)))
+            .with_inner_size(mon_size)
+            .with_position(mon_pos)
             .with_visible(false) // stay hidden until the first frame is ready
             .build(&event_loop)
             .unwrap(),
     );
 
-    // Click-through: mouse events fall through to whatever is underneath.
-    let _ = window.set_cursor_hittest(false);
-
     let mut state = pollster::block_on(State::new(window.clone(), shared.clone()));
 
-    // Capture exclusion must come AFTER the first surface configuration:
-    // SetWindowDisplayAffinity implicitly makes the window layered, and DXGI
-    // refuses to create a flip-model swapchain on a layered window
-    // (0x887A0001). Setting it afterwards is the standard order; exclusion
-    // is a composition-time property and applies immediately.
+    // Click-through and capture exclusion must both come AFTER the first
+    // surface configuration: each one turns the window into a layered window
+    // (winit maps hittest(false) to WS_EX_TRANSPARENT | WS_EX_LAYERED, and
+    // SetWindowDisplayAffinity adds WS_EX_LAYERED implicitly), and DXGI
+    // refuses to CREATE a flip-model swapchain on a layered window
+    // (0x887A0001). Presenting to one that became layered afterwards is
+    // fine; this create-then-flag order is the standard D3D overlay pattern.
+    let _ = window.set_cursor_hittest(false);
     #[cfg(any(windows, target_os = "macos"))]
     exclude_from_capture(&window);
 
@@ -948,9 +1023,10 @@ fn main() {
                     let _ = state.render(); // pre-paint the hidden surface
                     state.window.set_visible(true);
                     // re-assert overlay traits after the hidden start
-                    state
-                        .window
-                        .set_fullscreen(Some(Fullscreen::Borderless(None)));
+                    // (manual monitor cover, never winit fullscreen: that
+                    // breaks DXGI swapchain creation, see dx12_probe)
+                    state.window.set_outer_position(mon_pos);
+                    let _ = state.window.request_inner_size(mon_size);
                     state.window.set_window_level(WindowLevel::AlwaysOnTop);
                     state.overlay_visible = true;
                 } else if !wanted && state.overlay_visible {
