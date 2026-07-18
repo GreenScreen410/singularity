@@ -8,7 +8,7 @@ whatever it passes over.
 Inspired by [ghostty-blackhole](https://github.com/s0xDk/ghostty-blackhole), but
 freed from Ghostty and Claude Code.
 
-<!-- ![demo](docs/demo.gif) - drop a screen recording here to show it off -->
+![A black hole drifting across the desktop, lensing the windows around it](docs/demo.gif)
 
 ## Features
 
