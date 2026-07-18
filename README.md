@@ -1,31 +1,31 @@
 # Singularity
 
 A slowly drifting black hole that bends your entire Windows desktop like a real
-gravitational lens — as a **single standalone app**. No terminal, no external
+gravitational lens - as a **single standalone app**. No terminal, no external
 tools: run one executable and the hole wanders across your screen, warping
 whatever it passes over.
 
 Inspired by [ghostty-blackhole](https://github.com/s0xDk/ghostty-blackhole), but
 freed from Ghostty and Claude Code.
 
-<!-- ![demo](docs/demo.gif) — drop a screen recording here to show it off -->
+<!-- ![demo](docs/demo.gif) - drop a screen recording here to show it off -->
 
 ## Features
 
-- **Real physics** — every pixel near the hole integrates its own null geodesic
+- **Real physics** - every pixel near the hole integrates its own null geodesic
   through the Schwarzschild metric (after Eric Bruneton's black-hole renderer,
   via [ghostty-blackhole](https://github.com/s0xDk/ghostty-blackhole)): a true
   shadow, an Einstein ring with mirrored secondary images, and a tilted
   Keplerian accretion disk whose far side arcs over and under the hole
-- **Blackbody accretion disk** — Shakura–Sunyaev temperature profile,
+- **Blackbody accretion disk** - Shakura-Sunyaev temperature profile,
   relativistic Doppler shift and beaming, gravitational time dilation
-- **8 looks, switched live** — Inferno, Gargantua, Quasar, M87\* donut, Blazar,
-  Face-on ember, Pure lens, Zen — pick from the tray menu, with a smooth
+- **8 looks, switched live** - Inferno, Gargantua, Quasar, M87\* donut, Blazar,
+  Face-on ember, Pure lens, Zen - pick from the tray menu, with a smooth
   crossfade (the original tuner's presets, exact values)
-- **A real overlay** — fullscreen, always-on-top, click-through; your apps keep
+- **A real overlay** - fullscreen, always-on-top, click-through; your apps keep
   working underneath while the hole warps them. The overlay excludes itself
   from capture, so there is no mirror-feedback
-- **Single self-contained exe** — no runtime, no installer, ~8 MB
+- **Single self-contained exe** - no runtime, no installer, ~8 MB
 
 ## Build & run
 
@@ -40,17 +40,17 @@ cargo run --release
 
 The overlay covers the screen, the hole drifts on its own, and clicks pass
 through to your apps. Switch the disk look from the tray icon (the ^ overflow
-area) — 8 presets from Inferno to Zen. Quit via the tray menu or Esc.
+area) - 8 presets from Inferno to Zen. Quit via the tray menu or Esc.
 
 Cross-compiling from WSL also works: `rustup target add x86_64-pc-windows-gnu`,
 install `mingw-w64`, then `cargo build --release --target x86_64-pc-windows-gnu`.
 
-### macOS (UNTESTED — help wanted)
+### macOS (UNTESTED - help wanted)
 
 The macOS port (ScreenCaptureKit capture + `NSWindowSharingNone` self-exclusion
 + menu-bar presets) is structurally complete and kept type-checked via
 `cargo check --target aarch64-apple-darwin`, but has never run on real
-hardware — there is no Mac in this project's dev loop.
+hardware - there is no Mac in this project's dev loop.
 
 ```sh
 cargo run --release   # on a Mac
@@ -62,7 +62,7 @@ are equally welcome as issues.
 
 ### Linux
 
-Not yet — neither X11 nor Wayland offers a way to exclude a window from
+Not yet - neither X11 nor Wayland offers a way to exclude a window from
 capture, so a live overlay feeds back into itself. A wallpaper-warp mode is
 the likely path; contributions welcome.
 
@@ -95,13 +95,13 @@ drift and integration budget in `src/singularity.wgsl` (`DRIFT_*`, `N_STEPS`).
 A desktop overlay runs a continuous capture + render loop, so on a laptop
 expect noticeably higher power draw while active. Only pixels near the hole
 pay for geodesic integration, but frame-rate capping and idle throttling are
-still on the roadmap — treat it as a plugged-in toy for now.
+still on the roadmap - treat it as a plugged-in toy for now.
 
 ## A note on Windows SmartScreen
 
 Release binaries are not code-signed (certificates are priced for companies,
 not desk toys). The first launch of a downloaded exe may show "Windows
-protected your PC" — click **More info → Run anyway**, or build from source.
+protected your PC" - click **More info → Run anyway**, or build from source.
 
 ## Credits
 
@@ -110,4 +110,4 @@ protected your PC" — click **More info → Run anyway**, or build from source.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

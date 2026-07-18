@@ -1,6 +1,6 @@
 // macOS desktop capture via ScreenCaptureKit (objc2 bindings).
 //
-// STATUS: structurally complete but UNTESTED on real hardware — no Mac in the
+// STATUS: structurally complete but UNTESTED on real hardware - no Mac in the
 // dev loop. It is kept honest with `cargo check --target aarch64-apple-darwin`
 // (the objc2 crates are pure Rust declarations, so they type-check anywhere).
 // If you run this on a Mac and something misbehaves, please open an issue.
@@ -10,7 +10,7 @@
 // grant it and relaunch.
 //
 // Self-capture feedback is prevented in main.rs by setting the overlay
-// NSWindow's sharingType to NSWindowSharingNone — the macOS equivalent of
+// NSWindow's sharingType to NSWindowSharingNone - the macOS equivalent of
 // Windows' WDA_EXCLUDEFROMCAPTURE.
 
 use crate::Shared;
@@ -30,7 +30,7 @@ use objc2_screen_capture_kit::{
     SCStreamOutputType,
 };
 
-// kCVPixelFormatType_32BGRA — matches the Bgra8UnormSrgb texture upload path.
+// kCVPixelFormatType_32BGRA - matches the Bgra8UnormSrgb texture upload path.
 const FORMAT_32BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
 define_class!(
@@ -104,7 +104,7 @@ pub fn start(shared: Shared) {
         if content.is_null() {
             let msg = unsafe { error.as_ref().map(|e| e.localizedDescription()) };
             eprintln!(
-                "capture: no shareable content — grant Screen Recording permission \
+                "capture: no shareable content - grant Screen Recording permission \
                  in System Settings and relaunch ({msg:?})"
             );
             return;
@@ -128,7 +128,7 @@ pub fn start(shared: Shared) {
             let config = SCStreamConfiguration::new();
             // SCDisplay reports points; on Retina the stream still delivers
             // a full-resolution buffer scaled to this size. Good enough for
-            // a lensed background — revisit with pointPixelScale if blurry.
+            // a lensed background - revisit with pointPixelScale if blurry.
             config.setWidth(display.width() as usize);
             config.setHeight(display.height() as usize);
             config.setPixelFormat(FORMAT_32BGRA);

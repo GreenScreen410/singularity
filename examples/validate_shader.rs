@@ -14,7 +14,7 @@ fn main() {
         naga::valid::Capabilities::all(),
     );
     match validator.validate(&module) {
-        Ok(_) => println!("WGSL OK — parsed and validated."),
+        Ok(_) => println!("WGSL OK - parsed and validated."),
         Err(e) => {
             eprintln!("WGSL VALIDATION ERROR:\n{}", e.emit_to_string(src));
             std::process::exit(1);

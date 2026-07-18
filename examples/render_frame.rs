@@ -1,4 +1,4 @@
-// Offscreen render of one frame to a raw RGBA file — lets us verify the
+// Offscreen render of one frame to a raw RGBA file - lets us verify the
 // shader + uniform layout without a window or a Windows machine.
 // Run: cargo run --example render_frame   -> /tmp/singularity_frame.rgba
 

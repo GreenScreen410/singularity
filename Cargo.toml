@@ -25,7 +25,7 @@ windows-capture = "2"
 raw-window-handle = "0.6"
 tray-icon = "0.19"
 
-# macOS support is structurally complete but UNTESTED — no Mac in the dev
+# macOS support is structurally complete but UNTESTED - no Mac in the dev
 # loop. It is kept type-checked via `cargo check --target aarch64-apple-darwin`
 # (the objc2 binding crates are pure Rust declarations, so they type-check on
 # any host; only the final link needs a Mac).

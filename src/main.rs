@@ -1,11 +1,11 @@
-// Singularity — a drifting black hole over the live desktop.
+// Singularity - a drifting black hole over the live desktop.
 // Desktop captured via Windows.Graphics.Capture; our own window is excluded
 // from capture so we don't feed back into ourselves. Falls back to a test
 // pattern until the first frame.
 //
 // GUI subsystem: no console window. Diagnostics (capture/overlay eprintln)
 // are invisible in normal use; for debugging, temporarily comment this out
-// or check with a debugger — Esc and the tray's 종료 both still quit.
+// or check with a debugger - Esc and the tray's Quit both still work.
 #![windows_subsystem = "windows"]
 
 use std::sync::{Arc, Mutex};
@@ -108,24 +108,26 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("singularity.toml"))
 }
 
-// only written from the tray's "설정 파일 열기", which Linux doesn't build
+// only written from the tray's "Open Config File", which Linux doesn't build
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const DEFAULT_CONFIG: &str = "\
-# Singularity 설정 — 저장하면 1초 안에 반영됩니다.
-# 앞의 #을 지우면(주석 해제) 그 값이 트레이 메뉴보다 우선 적용됩니다.
+# Singularity settings. Saved changes apply within a second, no restart.
+# Remove the leading # to activate a line; active values take priority
+# over the tray menu until they change again.
 
-# 모양 프리셋: inferno | gargantua | quasar | m87 | blazar | ember | lens | zen
+# Disk look: inferno | gargantua | quasar | m87 | blazar | ember | lens | zen
 #preset = gargantua
 
-# 그림자 반지름 (화면 높이 비율). 트레이의 작게/보통/크게 = 0.06 / 0.09 / 0.14
+# Shadow radius as a fraction of screen height.
+# Tray Small / Medium / Large = 0.06 / 0.09 / 0.14
 #size = 0.09
 
-# 떠다니는 속도 배율과 가로/세로 이동 범위 (0 ~ 0.5)
+# Wander speed multiplier and horizontal/vertical range (0 to 0.5).
 #drift_speed = 1.0
 #drift_x = 0.20
 #drift_y = 0.14
 
-# 초당 프레임 제한 (배터리 절약). 0 = 무제한(모니터 주사율)
+# Frame rate cap (saves battery). 0 = uncapped (monitor refresh rate).
 #fps = 0
 ";
 
@@ -535,7 +537,7 @@ fn exclude_from_capture(window: &Window) {
     }
 }
 
-/// Programmatic tray icon: a black hole — dark disc with a warm ring.
+/// Programmatic tray icon: a black hole - dark disc with a warm ring.
 #[cfg(any(windows, target_os = "macos"))]
 fn tray_icon_rgba(size: u32) -> Vec<u8> {
     let mut px = Vec::with_capacity((size * size * 4) as usize);
@@ -566,14 +568,14 @@ fn main() {
     #[cfg(any(windows, target_os = "macos"))]
     capture::start(shared.clone());
 
-    // ---- tray icon with preset + options menu (Windows: 작업표시줄 ^ / macOS: 메뉴바) ----
+    // ---- tray icon with preset + options menu (Windows: taskbar overflow / macOS: menu bar) ----
     // sub-option values, shared by the menu and its handler
     #[cfg(any(windows, target_os = "macos"))]
-    const SIZES: [(&str, f32); 3] = [("작게", 0.06), ("보통", 0.09), ("크게", 0.14)];
+    const SIZES: [(&str, f32); 3] = [("Small", 0.06), ("Medium", 0.09), ("Large", 0.14)];
     #[cfg(any(windows, target_os = "macos"))]
-    const SPEEDS: [(&str, f32); 3] = [("느림", 0.4), ("보통", 1.0), ("빠름", 2.2)];
+    const SPEEDS: [(&str, f32); 3] = [("Slow", 0.4), ("Normal", 1.0), ("Fast", 2.2)];
     #[cfg(any(windows, target_os = "macos"))]
-    const FPS_OPTS: [(&str, u32); 3] = [("30", 30), ("60", 60), ("무제한", 0)];
+    const FPS_OPTS: [(&str, u32); 3] = [("30", 30), ("60", 60), ("Unlimited", 0)];
     #[cfg(any(windows, target_os = "macos"))]
     let (_tray, preset_items, size_items, speed_items, fps_items, open_cfg_id, quit_id) = {
         use tray_icon::{
@@ -588,7 +590,7 @@ fn main() {
             items.push(item);
         }
         menu.append(&PredefinedMenuItem::separator()).unwrap();
-        // stepped option submenus; default checked = 보통/보통/무제한
+        // stepped option submenus; default checked = Medium/Normal/Unlimited
         let mut sub = |title: &str, names: &[&str], default: usize| -> Vec<CheckMenuItem> {
             let submenu = Submenu::new(title, true);
             let items: Vec<CheckMenuItem> = names
@@ -602,18 +604,18 @@ fn main() {
             menu.append(&submenu).unwrap();
             items
         };
-        let size_items = sub("크기", &SIZES.map(|s| s.0), 1);
-        let speed_items = sub("속도", &SPEEDS.map(|s| s.0), 1);
+        let size_items = sub("Size", &SIZES.map(|s| s.0), 1);
+        let speed_items = sub("Speed", &SPEEDS.map(|s| s.0), 1);
         let fps_items = sub("FPS", &FPS_OPTS.map(|s| s.0), 2);
         menu.append(&PredefinedMenuItem::separator()).unwrap();
-        let open_cfg = MenuItem::new("설정 파일 열기", true, None);
+        let open_cfg = MenuItem::new("Open Config File", true, None);
         menu.append(&open_cfg).unwrap();
-        let quit = MenuItem::new("종료", true, None);
+        let quit = MenuItem::new("Quit", true, None);
         menu.append(&quit).unwrap();
         let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32).unwrap();
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Singularity — 우클릭으로 모양/옵션 변경")
+            .with_tooltip("Singularity - right-click to change look and options")
             .with_icon(icon)
             .build()
             .unwrap();
@@ -691,14 +693,14 @@ fn main() {
                 // no WM_PAINT, so render() never runs while hidden and a
                 // render-side reveal deadlocks into an invisible app. Wait for
                 // the first capture frame (or 3s), paint once while still
-                // hidden, then show — no white flash, no test-pattern flash.
+                // hidden, then show - no white flash, no test-pattern flash.
                 if !state.shown {
                     let ready = { shared.lock().unwrap().width > 0 };
                     let waited = state.start.elapsed().as_secs_f32();
                     if ready || waited > 3.0 {
                         if !ready {
                             eprintln!(
-                                "warning: no capture frame after {waited:.1}s — \
+                                "warning: no capture frame after {waited:.1}s - \
                                  showing test pattern; check 'capture:' messages above"
                             );
                         }

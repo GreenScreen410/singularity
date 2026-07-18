@@ -1,18 +1,18 @@
-// Singularity — a geodesic-traced black hole over the live desktop.
+// Singularity - a geodesic-traced black hole over the live desktop.
 //
 // Faithful WGSL port of s0xDk/ghostty-blackhole (MIT), itself after Eric
 // Bruneton's "Real-time High-Quality Rendering of Non-Rotating Black Holes".
-// Each pixel's null geodesic is integrated numerically in 3D — the Binet-form
+// Each pixel's null geodesic is integrated numerically in 3D - the Binet-form
 // photon acceleration  a = -(3/2) h² x / r⁵  reproduces exact Schwarzschild
 // bending. Everything falls out of that integration:
 //
-//   * shadow        — rays under b_crit = (3√3/2) r_s spiral into the horizon
-//   * lensing       — escaped rays are projected back onto the desktop "sky"
+//   * shadow        - rays under b_crit = (3√3/2) r_s spiral into the horizon
+//   * lensing       - escaped rays are projected back onto the desktop "sky"
 //                     plane: your screen bends, magnifies, mirrors in the ring
-//   * photon ring   — rays winding near the r = 1.5 r_s photon sphere
-//   * accretion disk— a thin tilted Keplerian disk the ray may cross several
+//   * photon ring   - rays winding near the r = 1.5 r_s photon sphere
+//   * accretion disk -  a thin tilted Keplerian disk the ray may cross several
 //                     times (the far side arcs over and under the shadow);
-//                     blackbody color from a Shakura–Sunyaev temperature
+//                     blackbody color from a Shakura-Sunyaev temperature
 //                     profile, Doppler-shifted and beamed
 //
 // The terminal-specific modes (token/pomodoro/cursor decode) are replaced by
@@ -70,7 +70,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VSOut {
 // ---------------------------------------------------------------- tunables --
 // Disk look, size and drift come from the uniforms (tray menu / config file);
 // only the hole-independent knobs stay compile-time.
-const LENS_DEPTH: f32    = 13.0;   // hole-to-sky-plane distance in r_s — bigger = bends harder
+const LENS_DEPTH: f32    = 13.0;   // hole-to-sky-plane distance in r_s - bigger = bends harder
 const N_STEPS: i32       = 48;     // geodesic steps per pixel (perf dial)
 const B_CRIT: f32        = 2.5980762; // critical impact parameter, r_s
 
@@ -100,7 +100,7 @@ fn hash21(pin: vec2<f32>) -> f32 {
     return fract(p.x * p.y);
 }
 
-// value noise whose y lattice wraps every perY cells — the disk's angular
+// value noise whose y lattice wraps every perY cells - the disk's angular
 // dimension, so streaks tile seamlessly across the atan branch cut
 fn vnoiseWrapY(p: vec2<f32>, perY: f32) -> f32 {
     let i = floor(p);
@@ -190,7 +190,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let Z0   = max(14.0, rout + 5.0);    // camera distance (shared with tracer)
 
     // ================= far field: analytic weak deflection ==================
-    // finite-camera fitted mapping — sub-1% displacement match at the handoff
+    // finite-camera fitted mapping - sub-1% displacement match at the handoff
     // circle, so there is no visible seam against the integrated region
     if (b >= bmax) {
         let uu   = Z0 * inverseSqrt(Z0 * Z0 + b * b);
@@ -277,7 +277,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 var g = gloc / max(1.0 + beta * dot(gasdir, normalize(v)), 0.05);
                 g = mix(1.0, g, u.dopp);
 
-                // Shakura–Sunyaev temperature profile, peak normalized to 1
+                // Shakura-Sunyaev temperature profile, peak normalized to 1
                 let xpr   = max(1.0 - sqrt(rin / rc), 0.0);
                 let tprof = pow(rin / rc, 0.75) * pow(xpr, 0.25) / 0.488;
                 let cbb   = blackbody(u.temp * tprof * g);      // shifted color
@@ -305,7 +305,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             let hp  = x + d * tpl;
             let q   = rot(hp.xy, -u.roll) / W;
             let sp  = vec2<f32>(q.x, -q.y);
-            // fade the *displacement*, never the color — no seam anywhere
+            // fade the *displacement*, never the color - no seam anywhere
             let suv = center + (p + (sp - p) * window) / vec2<f32>(aspect, 1.0);
             // rays bent past ~90° never reach the sky plane; fade them out
             let toward = smoothstep(0.05, 0.35, -d.z);

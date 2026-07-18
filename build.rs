@@ -8,7 +8,7 @@ fn main() {
         res.set("FileDescription", "A drifting black hole over your desktop");
         res.set("LegalCopyright", "MIT License");
         if let Err(e) = res.compile() {
-            // Don't fail the build over a missing windres — just skip the icon.
+            // Don't fail the build over a missing windres - just skip the icon.
             println!("cargo:warning=icon resource skipped: {e}");
         }
     }

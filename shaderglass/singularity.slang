@@ -1,7 +1,7 @@
 #version 450
 
 // =====================================================================
-//  Singularity  —  a slowly drifting black hole for your Windows desktop
+//  Singularity  -  a slowly drifting black hole for your Windows desktop
 //
 //  A ShaderGlass (RetroArch .slang) effect. It warps the captured desktop
 //  (Source) like light bending around a black hole, and the hole wanders
