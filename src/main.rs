@@ -43,10 +43,16 @@ struct Uniforms {
     has_desktop: f32,
     look: [f32; 14], // temp incl roll inner outer opac dopp beam gain contr wind speed expo star
     hole_radius: f32,
-    _pad: f32,
+    drift_speed: f32,
+    drift_x: f32,
+    drift_y: f32,
+    _pad: [f32; 2],
 }
 
-const HOLE_RADIUS: f32 = 0.09; // shadow radius, fraction of screen height
+const DEFAULT_SIZE: f32 = 0.09; // shadow radius, fraction of screen height
+const DEFAULT_DRIFT_SPEED: f32 = 1.0;
+const DEFAULT_DRIFT_X: f32 = 0.20;
+const DEFAULT_DRIFT_Y: f32 = 0.14;
 const PRESET_FADE_SEC: f32 = 1.0; // crossfade time when switching looks
 
 // The 8 looks from the original's tuner (ParamSpec.swift), resolved against
@@ -62,6 +68,75 @@ const PRESETS: [(&str, [f32; 14]); 8] = [
     ("Zen",           [ 7000.0, 1.45,  0.15, 3.5,  7.0, 0.40, 0.50, 2.0, 0.5, 0.3, 3.0, 1.5, 0.70, 0.0]),
 ];
 const DEFAULT_PRESET: usize = 1; // Gargantua
+
+// config-file keys for the presets, in PRESETS order
+const PRESET_KEYS: [&str; 8] = [
+    "inferno", "gargantua", "quasar", "m87", "blazar", "ember", "lens", "zen",
+];
+
+/// Values parsed from singularity.toml; None = key absent/commented out.
+#[derive(Clone, Copy, PartialEq, Default)]
+struct FileCfg {
+    preset: Option<usize>,
+    size: Option<f32>,
+    drift_speed: Option<f32>,
+    drift_x: Option<f32>,
+    drift_y: Option<f32>,
+    fps: Option<u32>,
+}
+
+fn parse_config(text: &str) -> FileCfg {
+    let mut cfg = FileCfg::default();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "preset" => cfg.preset = PRESET_KEYS.iter().position(|p| p.eq_ignore_ascii_case(v)),
+            "size" => cfg.size = v.parse().ok(),
+            "drift_speed" => cfg.drift_speed = v.parse().ok(),
+            "drift_x" => cfg.drift_x = v.parse().ok(),
+            "drift_y" => cfg.drift_y = v.parse().ok(),
+            "fps" => cfg.fps = v.parse().ok(),
+            _ => {}
+        }
+    }
+    cfg
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("singularity.toml"))
+}
+
+// only written from the tray's "설정 파일 열기", which Linux doesn't build
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+const DEFAULT_CONFIG: &str = "\
+# Singularity 설정 — 저장하면 1초 안에 반영됩니다.
+# 앞의 #을 지우면(주석 해제) 그 값이 트레이 메뉴보다 우선 적용됩니다.
+
+# 모양 프리셋: inferno | gargantua | quasar | m87 | blazar | ember | lens | zen
+#preset = gargantua
+
+# 그림자 반지름 (화면 높이 비율). 트레이의 작게/보통/크게 = 0.06 / 0.09 / 0.14
+#size = 0.09
+
+# 떠다니는 속도 배율과 가로/세로 이동 범위 (0 ~ 0.5)
+#drift_speed = 1.0
+#drift_x = 0.20
+#drift_y = 0.14
+
+# 초당 프레임 제한 (배터리 절약). 0 = 무제한(모니터 주사율)
+#fps = 0
+";
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn ensure_config_file(path: &std::path::Path) {
+    if !path.exists() {
+        if let Err(e) = std::fs::write(path, DEFAULT_CONFIG) {
+            eprintln!("config: cannot create {}: {e}", path.display());
+        }
+    }
+}
 
 struct State {
     window: Arc<Window>,
@@ -85,6 +160,11 @@ struct State {
     look_from: [f32; 14],
     look_to: [f32; 14],
     fade_start: std::time::Instant,
+    hole_radius: f32,
+    drift_speed: f32,
+    drift_x: f32,
+    drift_y: f32,
+    fps: u32, // 0 = uncapped (vsync only)
 }
 
 impl State {
@@ -240,6 +320,11 @@ impl State {
             look_from: PRESETS[DEFAULT_PRESET].1,
             look_to: PRESETS[DEFAULT_PRESET].1,
             fade_start: std::time::Instant::now(),
+            hole_radius: DEFAULT_SIZE,
+            drift_speed: DEFAULT_DRIFT_SPEED,
+            drift_x: DEFAULT_DRIFT_X,
+            drift_y: DEFAULT_DRIFT_Y,
+            fps: 0,
         }
     }
 
@@ -322,8 +407,11 @@ impl State {
             time: self.start.elapsed().as_secs_f32(),
             has_desktop: if self.has_desktop { 1.0 } else { 0.0 },
             look: self.current_look(),
-            hole_radius: HOLE_RADIUS,
-            _pad: 0.0,
+            hole_radius: self.hole_radius,
+            drift_speed: self.drift_speed,
+            drift_x: self.drift_x,
+            drift_y: self.drift_y,
+            _pad: [0.0; 2],
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
@@ -478,11 +566,18 @@ fn main() {
     #[cfg(any(windows, target_os = "macos"))]
     capture::start(shared.clone());
 
-    // ---- tray icon with preset menu (Windows: 작업표시줄 ^ / macOS: 메뉴바) ----
+    // ---- tray icon with preset + options menu (Windows: 작업표시줄 ^ / macOS: 메뉴바) ----
+    // sub-option values, shared by the menu and its handler
     #[cfg(any(windows, target_os = "macos"))]
-    let (_tray, preset_items, quit_id) = {
+    const SIZES: [(&str, f32); 3] = [("작게", 0.06), ("보통", 0.09), ("크게", 0.14)];
+    #[cfg(any(windows, target_os = "macos"))]
+    const SPEEDS: [(&str, f32); 3] = [("느림", 0.4), ("보통", 1.0), ("빠름", 2.2)];
+    #[cfg(any(windows, target_os = "macos"))]
+    const FPS_OPTS: [(&str, u32); 3] = [("30", 30), ("60", 60), ("무제한", 0)];
+    #[cfg(any(windows, target_os = "macos"))]
+    let (_tray, preset_items, size_items, speed_items, fps_items, open_cfg_id, quit_id) = {
         use tray_icon::{
-            menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+            menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
             Icon, TrayIconBuilder,
         };
         let menu = Menu::new();
@@ -493,17 +588,52 @@ fn main() {
             items.push(item);
         }
         menu.append(&PredefinedMenuItem::separator()).unwrap();
+        // stepped option submenus; default checked = 보통/보통/무제한
+        let mut sub = |title: &str, names: &[&str], default: usize| -> Vec<CheckMenuItem> {
+            let submenu = Submenu::new(title, true);
+            let items: Vec<CheckMenuItem> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| CheckMenuItem::new(*n, true, i == default, None))
+                .collect();
+            for it in &items {
+                submenu.append(it).unwrap();
+            }
+            menu.append(&submenu).unwrap();
+            items
+        };
+        let size_items = sub("크기", &SIZES.map(|s| s.0), 1);
+        let speed_items = sub("속도", &SPEEDS.map(|s| s.0), 1);
+        let fps_items = sub("FPS", &FPS_OPTS.map(|s| s.0), 2);
+        menu.append(&PredefinedMenuItem::separator()).unwrap();
+        let open_cfg = MenuItem::new("설정 파일 열기", true, None);
+        menu.append(&open_cfg).unwrap();
         let quit = MenuItem::new("종료", true, None);
         menu.append(&quit).unwrap();
         let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32).unwrap();
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Singularity — 우클릭으로 모양 변경")
+            .with_tooltip("Singularity — 우클릭으로 모양/옵션 변경")
             .with_icon(icon)
             .build()
             .unwrap();
-        (tray, items, quit.id().clone())
+        (
+            tray,
+            items,
+            size_items,
+            speed_items,
+            fps_items,
+            open_cfg.id().clone(),
+            quit.id().clone(),
+        )
     };
+
+    // config-file hot-reload state
+    let cfg_path = config_path();
+    let mut cfg_mtime: Option<std::time::SystemTime> = None;
+    let mut prev_cfg = FileCfg::default();
+    let mut last_cfg_check = std::time::Instant::now();
+    let mut next_frame = std::time::Instant::now();
 
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(
@@ -587,18 +717,103 @@ fn main() {
                 // tray menu events arrive on a global channel; poll each tick
                 #[cfg(any(windows, target_os = "macos"))]
                 while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+                    let check_one = |items: &[tray_icon::menu::CheckMenuItem], idx: usize| {
+                        for (j, it) in items.iter().enumerate() {
+                            it.set_checked(j == idx);
+                        }
+                    };
                     if ev.id == quit_id {
                         elwt.exit();
+                    } else if ev.id == open_cfg_id {
+                        if let Some(path) = &cfg_path {
+                            ensure_config_file(path);
+                            #[cfg(windows)]
+                            let _ = std::process::Command::new("notepad").arg(path).spawn();
+                            #[cfg(target_os = "macos")]
+                            let _ = std::process::Command::new("open")
+                                .arg("-t")
+                                .arg(path)
+                                .spawn();
+                        }
                     } else if let Some(idx) =
                         preset_items.iter().position(|it| it.id() == &ev.id)
                     {
                         state.set_preset(idx);
-                        for (j, it) in preset_items.iter().enumerate() {
-                            it.set_checked(j == idx);
+                        check_one(&preset_items, idx);
+                    } else if let Some(idx) = size_items.iter().position(|it| it.id() == &ev.id)
+                    {
+                        state.hole_radius = SIZES[idx].1;
+                        check_one(&size_items, idx);
+                    } else if let Some(idx) =
+                        speed_items.iter().position(|it| it.id() == &ev.id)
+                    {
+                        state.drift_speed = SPEEDS[idx].1;
+                        check_one(&speed_items, idx);
+                    } else if let Some(idx) = fps_items.iter().position(|it| it.id() == &ev.id) {
+                        state.fps = FPS_OPTS[idx].1;
+                        check_one(&fps_items, idx);
+                    }
+                }
+
+                // config-file hot-reload: poll mtime ~1/s, apply only fields
+                // whose value changed since the last read (so the tray keeps
+                // authority over anything the file doesn't change)
+                if last_cfg_check.elapsed().as_secs_f32() > 1.0 {
+                    last_cfg_check = std::time::Instant::now();
+                    if let Some(path) = &cfg_path {
+                        if let Ok(modified) =
+                            std::fs::metadata(path).and_then(|m| m.modified())
+                        {
+                            if cfg_mtime != Some(modified) {
+                                cfg_mtime = Some(modified);
+                                if let Ok(text) = std::fs::read_to_string(path) {
+                                    let cfg = parse_config(&text);
+                                    if cfg.preset != prev_cfg.preset {
+                                        if let Some(i) = cfg.preset {
+                                            state.set_preset(i);
+                                            #[cfg(any(windows, target_os = "macos"))]
+                                            for (j, it) in preset_items.iter().enumerate() {
+                                                it.set_checked(j == i);
+                                            }
+                                        }
+                                    }
+                                    if cfg.size != prev_cfg.size {
+                                        state.hole_radius = cfg.size.unwrap_or(DEFAULT_SIZE);
+                                    }
+                                    if cfg.drift_speed != prev_cfg.drift_speed {
+                                        state.drift_speed =
+                                            cfg.drift_speed.unwrap_or(DEFAULT_DRIFT_SPEED);
+                                    }
+                                    if cfg.drift_x != prev_cfg.drift_x {
+                                        state.drift_x = cfg.drift_x.unwrap_or(DEFAULT_DRIFT_X);
+                                    }
+                                    if cfg.drift_y != prev_cfg.drift_y {
+                                        state.drift_y = cfg.drift_y.unwrap_or(DEFAULT_DRIFT_Y);
+                                    }
+                                    if cfg.fps != prev_cfg.fps {
+                                        state.fps = cfg.fps.unwrap_or(0);
+                                    }
+                                    prev_cfg = cfg;
+                                }
+                            }
                         }
                     }
                 }
-                state.window.request_redraw();
+
+                // frame pacing: uncapped -> vsync-bound Poll; capped -> wake
+                // at the next frame deadline (saves battery)
+                if state.fps == 0 {
+                    state.window.request_redraw();
+                    elwt.set_control_flow(ControlFlow::Poll);
+                } else {
+                    let now = std::time::Instant::now();
+                    if now >= next_frame {
+                        next_frame =
+                            now + std::time::Duration::from_secs_f64(1.0 / state.fps as f64);
+                        state.window.request_redraw();
+                    }
+                    elwt.set_control_flow(ControlFlow::WaitUntil(next_frame));
+                }
             }
             _ => {}
         })

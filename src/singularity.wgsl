@@ -39,7 +39,10 @@ struct Uniforms {
     expo: f32,          // tonemap exposure
     star: f32,          // lensed starfield gain
     hole_radius: f32,   // shadow radius, fraction of screen height
-    _pad: f32,
+    drift_speed: f32,   // wander speed multiplier
+    drift_x: f32,       // horizontal wander amplitude (0..0.5)
+    drift_y: f32,       // vertical wander amplitude   (0..0.5)
+    _pad: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var desktop_tex: texture_2d<f32>;
@@ -65,13 +68,9 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VSOut {
 }
 
 // ---------------------------------------------------------------- tunables --
-// Disk look & size come from the uniforms (tray-menu presets); only the
-// hole-independent knobs stay compile-time.
+// Disk look, size and drift come from the uniforms (tray menu / config file);
+// only the hole-independent knobs stay compile-time.
 const LENS_DEPTH: f32    = 13.0;   // hole-to-sky-plane distance in r_s — bigger = bends harder
-const DRIFT_SPEED: f32   = 1.0;    // how fast the hole floats around
-const DRIFT_X: f32       = 0.20;   // horizontal wander amplitude (0..0.5)
-const DRIFT_Y: f32       = 0.14;   // vertical wander amplitude   (0..0.5)
-
 const N_STEPS: i32       = 48;     // geodesic steps per pixel (perf dial)
 const B_CRIT: f32        = 2.5980762; // critical impact parameter, r_s
 
@@ -172,7 +171,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     // slow self-drift (Lissajous, never repeats)
     let center = vec2<f32>(0.5, 0.5)
-               + lissa(t * 0.12 * DRIFT_SPEED) * vec2<f32>(DRIFT_X, DRIFT_Y);
+               + lissa(t * 0.12 * u.drift_speed) * vec2<f32>(u.drift_x, u.drift_y);
 
     // aspect-corrected frame centered on the hole (y in screen heights)
     let p    = (uv - center) * vec2<f32>(aspect, 1.0);

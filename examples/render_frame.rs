@@ -10,7 +10,10 @@ struct Uniforms {
     has_desktop: f32,
     look: [f32; 14],
     hole_radius: f32,
-    _pad: f32,
+    drift_speed: f32,
+    drift_x: f32,
+    drift_y: f32,
+    _pad: [f32; 2],
 }
 
 const GARGANTUA: [f32; 14] =
@@ -145,7 +148,10 @@ fn main() {
             has_desktop: 0.0,
             look: GARGANTUA,
             hole_radius: 0.09,
-            _pad: 0.0,
+            drift_speed: 1.0,
+            drift_x: 0.20,
+            drift_y: 0.14,
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&u));
 
