@@ -83,6 +83,7 @@ struct FileCfg {
     drift_x: Option<f32>,
     drift_y: Option<f32>,
     fps: Option<u32>,
+    idle_minutes: Option<f32>,
 }
 
 fn parse_config(text: &str) -> FileCfg {
@@ -98,6 +99,7 @@ fn parse_config(text: &str) -> FileCfg {
             "drift_x" => cfg.drift_x = v.parse().ok(),
             "drift_y" => cfg.drift_y = v.parse().ok(),
             "fps" => cfg.fps = v.parse().ok(),
+            "idle_minutes" => cfg.idle_minutes = v.parse().ok(),
             _ => {}
         }
     }
@@ -129,6 +131,10 @@ const DEFAULT_CONFIG: &str = "\
 
 # Frame rate cap (saves battery). 0 = uncapped (monitor refresh rate).
 #fps = 0
+
+# Screensaver mode: appear only after this many minutes without any
+# keyboard/mouse input, and vanish on the first input. 0 = always visible.
+#idle_minutes = 0
 ";
 
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -157,7 +163,7 @@ struct State {
     shared: Shared,
     last_version: u64,
     has_desktop: bool,
-    shown: bool,
+    overlay_visible: bool,
     start: std::time::Instant,
     look_from: [f32; 14],
     look_to: [f32; 14],
@@ -166,7 +172,9 @@ struct State {
     drift_speed: f32,
     drift_x: f32,
     drift_y: f32,
-    fps: u32, // 0 = uncapped (vsync only)
+    fps: u32,          // 0 = uncapped (vsync only)
+    idle_minutes: f32, // 0 = always visible; >0 = appear after this much idle
+    appear_start: Option<std::time::Instant>, // grow-in animation anchor
 }
 
 impl State {
@@ -317,7 +325,7 @@ impl State {
             shared,
             last_version: 0,
             has_desktop: false,
-            shown: false,
+            overlay_visible: false,
             start: std::time::Instant::now(),
             look_from: PRESETS[DEFAULT_PRESET].1,
             look_to: PRESETS[DEFAULT_PRESET].1,
@@ -327,6 +335,8 @@ impl State {
             drift_x: DEFAULT_DRIFT_X,
             drift_y: DEFAULT_DRIFT_Y,
             fps: 0,
+            idle_minutes: 0.0,
+            appear_start: None,
         }
     }
 
@@ -339,6 +349,18 @@ impl State {
             out[i] = self.look_from[i] + (self.look_to[i] - self.look_from[i]) * e;
         }
         out
+    }
+
+    /// Screensaver grow-in: 0 -> 1 over ~2 s after the overlay appears from
+    /// idle, so the hole swells out of nothing instead of popping in.
+    fn appear_factor(&self) -> f32 {
+        match self.appear_start {
+            Some(t0) => {
+                let x = (t0.elapsed().as_secs_f32() / 2.0).min(1.0);
+                x * x * (3.0 - 2.0 * x)
+            }
+            None => 1.0,
+        }
     }
 
     // only reachable from the tray menu, which Linux doesn't build
@@ -409,7 +431,7 @@ impl State {
             time: self.start.elapsed().as_secs_f32(),
             has_desktop: if self.has_desktop { 1.0 } else { 0.0 },
             look: self.current_look(),
-            hole_radius: self.hole_radius,
+            hole_radius: self.hole_radius * self.appear_factor(),
             drift_speed: self.drift_speed,
             drift_x: self.drift_x,
             drift_y: self.drift_y,
@@ -537,6 +559,48 @@ fn exclude_from_capture(window: &Window) {
     }
 }
 
+/// Seconds since the last system-wide keyboard/mouse input, like a
+/// screensaver would measure it.
+#[cfg(windows)]
+fn idle_seconds() -> f32 {
+    #[repr(C)]
+    struct LastInputInfo {
+        cb_size: u32,
+        dw_time: u32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetLastInputInfo(plii: *mut LastInputInfo) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetTickCount() -> u32;
+    }
+    let mut lii = LastInputInfo { cb_size: 8, dw_time: 0 };
+    unsafe {
+        if GetLastInputInfo(&mut lii) != 0 {
+            GetTickCount().wrapping_sub(lii.dw_time) as f32 / 1000.0
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn idle_seconds() -> f32 {
+    // kCGEventSourceStateCombinedSessionState = 0, kCGAnyInputEventType = !0
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+    }
+    unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) as f32 }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn idle_seconds() -> f32 {
+    0.0
+}
+
 /// Programmatic tray icon: a black hole - dark disc with a warm ring.
 #[cfg(any(windows, target_os = "macos"))]
 fn tray_icon_rgba(size: u32) -> Vec<u8> {
@@ -577,7 +641,10 @@ fn main() {
     #[cfg(any(windows, target_os = "macos"))]
     const FPS_OPTS: [(&str, u32); 3] = [("30", 30), ("60", 60), ("Unlimited", 0)];
     #[cfg(any(windows, target_os = "macos"))]
-    let (_tray, preset_items, size_items, speed_items, fps_items, open_cfg_id, quit_id) = {
+    const IDLE_OPTS: [(&str, f32); 4] =
+        [("Off", 0.0), ("1 min", 1.0), ("5 min", 5.0), ("10 min", 10.0)];
+    #[cfg(any(windows, target_os = "macos"))]
+    let (_tray, preset_items, size_items, speed_items, fps_items, idle_items, open_cfg_id, quit_id) = {
         use tray_icon::{
             menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
             Icon, TrayIconBuilder,
@@ -607,6 +674,7 @@ fn main() {
         let size_items = sub("Size", &SIZES.map(|s| s.0), 1);
         let speed_items = sub("Speed", &SPEEDS.map(|s| s.0), 1);
         let fps_items = sub("FPS", &FPS_OPTS.map(|s| s.0), 2);
+        let idle_items = sub("Screensaver", &IDLE_OPTS.map(|s| s.0), 0);
         menu.append(&PredefinedMenuItem::separator()).unwrap();
         let open_cfg = MenuItem::new("Open Config File", true, None);
         menu.append(&open_cfg).unwrap();
@@ -625,6 +693,7 @@ fn main() {
             size_items,
             speed_items,
             fps_items,
+            idle_items,
             open_cfg.id().clone(),
             quit.id().clone(),
         )
@@ -636,6 +705,7 @@ fn main() {
     let mut prev_cfg = FileCfg::default();
     let mut last_cfg_check = std::time::Instant::now();
     let mut next_frame = std::time::Instant::now();
+    let mut boot_warned = false;
 
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(
@@ -689,32 +759,46 @@ fn main() {
                 }
             }
             Event::AboutToWait => {
-                // Reveal must live HERE, not in render(): a hidden window gets
-                // no WM_PAINT, so render() never runs while hidden and a
-                // render-side reveal deadlocks into an invisible app. Wait for
-                // the first capture frame (or 3s), paint once while still
-                // hidden, then show - no white flash, no test-pattern flash.
-                if !state.shown {
-                    let ready = { shared.lock().unwrap().width > 0 };
-                    let waited = state.start.elapsed().as_secs_f32();
-                    if ready || waited > 3.0 {
-                        if !ready {
-                            eprintln!(
-                                "warning: no capture frame after {waited:.1}s - \
-                                 showing test pattern; check 'capture:' messages above"
-                            );
-                        }
-                        state.update();
-                        let _ = state.render(); // pre-paint the hidden surface
-                        state.window.set_visible(true);
-                        // re-assert overlay traits after the hidden start
-                        state
-                            .window
-                            .set_fullscreen(Some(Fullscreen::Borderless(None)));
-                        state.window.set_window_level(WindowLevel::AlwaysOnTop);
-                        state.shown = true;
-                        eprintln!("overlay: revealed");
-                    }
+                // Visibility state machine. This must live HERE, not in
+                // render(): a hidden window gets no WM_PAINT, so render()
+                // never runs while hidden and a render-side reveal would
+                // deadlock into an invisible app.
+                //
+                // booted:  first capture frame arrived (or 3s fallback)
+                // wanted:  always, or only after idle_minutes without input
+                let ready = { shared.lock().unwrap().width > 0 };
+                let waited = state.start.elapsed().as_secs_f32();
+                let booted = ready || waited > 3.0;
+                if booted && !ready && !boot_warned {
+                    boot_warned = true;
+                    eprintln!(
+                        "warning: no capture frame after {waited:.1}s - \
+                         showing test pattern; check 'capture:' messages above"
+                    );
+                }
+                let idle_mode = state.idle_minutes > 0.0;
+                let wanted =
+                    booted && (!idle_mode || idle_seconds() >= state.idle_minutes * 60.0);
+                if wanted && !state.overlay_visible {
+                    // grow in from nothing when appearing out of idleness
+                    state.appear_start = if idle_mode {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    state.update();
+                    let _ = state.render(); // pre-paint the hidden surface
+                    state.window.set_visible(true);
+                    // re-assert overlay traits after the hidden start
+                    state
+                        .window
+                        .set_fullscreen(Some(Fullscreen::Borderless(None)));
+                    state.window.set_window_level(WindowLevel::AlwaysOnTop);
+                    state.overlay_visible = true;
+                } else if !wanted && state.overlay_visible {
+                    // any input dismisses the screensaver instantly
+                    state.window.set_visible(false);
+                    state.overlay_visible = false;
                 }
                 // tray menu events arrive on a global channel; poll each tick
                 #[cfg(any(windows, target_os = "macos"))]
@@ -754,6 +838,10 @@ fn main() {
                     } else if let Some(idx) = fps_items.iter().position(|it| it.id() == &ev.id) {
                         state.fps = FPS_OPTS[idx].1;
                         check_one(&fps_items, idx);
+                    } else if let Some(idx) = idle_items.iter().position(|it| it.id() == &ev.id)
+                    {
+                        state.idle_minutes = IDLE_OPTS[idx].1;
+                        check_one(&idle_items, idx);
                     }
                 }
 
@@ -795,6 +883,9 @@ fn main() {
                                     if cfg.fps != prev_cfg.fps {
                                         state.fps = cfg.fps.unwrap_or(0);
                                     }
+                                    if cfg.idle_minutes != prev_cfg.idle_minutes {
+                                        state.idle_minutes = cfg.idle_minutes.unwrap_or(0.0);
+                                    }
                                     prev_cfg = cfg;
                                 }
                             }
@@ -802,9 +893,14 @@ fn main() {
                     }
                 }
 
-                // frame pacing: uncapped -> vsync-bound Poll; capped -> wake
-                // at the next frame deadline (saves battery)
-                if state.fps == 0 {
+                // frame pacing: hidden -> low-power 0.5s idle polling (no
+                // rendering at all); uncapped -> vsync-bound Poll; capped ->
+                // wake at the next frame deadline (saves battery)
+                if !state.overlay_visible {
+                    elwt.set_control_flow(ControlFlow::WaitUntil(
+                        std::time::Instant::now() + std::time::Duration::from_millis(500),
+                    ));
+                } else if state.fps == 0 {
                     state.window.request_redraw();
                     elwt.set_control_flow(ControlFlow::Poll);
                 } else {

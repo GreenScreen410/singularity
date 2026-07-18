@@ -25,6 +25,9 @@ freed from Ghostty and Claude Code.
 - **A real overlay** - fullscreen, always-on-top, click-through; your apps keep
   working underneath while the hole warps them. The overlay excludes itself
   from capture, so there is no mirror-feedback
+- **Screensaver mode** - optionally appear only after N minutes without
+  keyboard/mouse input, swelling out of nothing, and vanish on the first
+  input (tray: Screensaver, or `idle_minutes` in the config file)
 - **Single self-contained exe** - no runtime, no installer, ~8 MB
 
 ## Build & run
