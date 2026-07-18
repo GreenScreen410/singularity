@@ -1,7 +1,12 @@
-// Singularity — Stage 2
-// Renders the drifting black-hole shader over the LIVE desktop, captured via
-// Windows.Graphics.Capture. Our own window is excluded from capture so we don't
-// feed back into ourselves. Falls back to a test pattern until the first frame.
+// Singularity — a drifting black hole over the live desktop.
+// Desktop captured via Windows.Graphics.Capture; our own window is excluded
+// from capture so we don't feed back into ourselves. Falls back to a test
+// pattern until the first frame.
+//
+// GUI subsystem: no console window. Diagnostics (capture/overlay eprintln)
+// are invisible in normal use; for debugging, temporarily comment this out
+// or check with a debugger — Esc and the tray's 종료 both still quit.
+#![windows_subsystem = "windows"]
 
 use std::sync::{Arc, Mutex};
 use winit::{
