@@ -624,6 +624,92 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
     px
 }
 
+// sub-option values, shared by the tray menu and its handler
+#[cfg(any(windows, target_os = "macos"))]
+const SIZES: [(&str, f32); 3] = [("Small", 0.06), ("Medium", 0.09), ("Large", 0.14)];
+#[cfg(any(windows, target_os = "macos"))]
+const SPEEDS: [(&str, f32); 3] = [("Slow", 0.4), ("Normal", 1.0), ("Fast", 2.2)];
+#[cfg(any(windows, target_os = "macos"))]
+const FPS_OPTS: [(&str, u32); 3] = [("30", 30), ("60", 60), ("Unlimited", 0)];
+#[cfg(any(windows, target_os = "macos"))]
+const IDLE_OPTS: [(&str, f32); 4] =
+    [("Off", 0.0), ("1 min", 1.0), ("5 min", 5.0), ("10 min", 10.0)];
+
+#[cfg(any(windows, target_os = "macos"))]
+struct Tray {
+    _icon: tray_icon::TrayIcon,
+    presets: Vec<tray_icon::menu::CheckMenuItem>,
+    sizes: Vec<tray_icon::menu::CheckMenuItem>,
+    speeds: Vec<tray_icon::menu::CheckMenuItem>,
+    fps: Vec<tray_icon::menu::CheckMenuItem>,
+    idles: Vec<tray_icon::menu::CheckMenuItem>,
+    open_cfg_id: tray_icon::menu::MenuId,
+    quit_id: tray_icon::menu::MenuId,
+}
+
+/// Build the tray icon with the preset + options menu (Windows: taskbar
+/// overflow area / macOS: menu bar).
+///
+/// Must be called AFTER the event loop has started (StartCause::Init): on
+/// macOS an NSStatusItem created before NSApplication is fully up crashes
+/// AppKit with NSCGSPanic (confirmed on Monterey), and winit only sets up
+/// NSApplication when the loop runs.
+#[cfg(any(windows, target_os = "macos"))]
+fn build_tray() -> Tray {
+    use tray_icon::{
+        menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
+        Icon, TrayIconBuilder,
+    };
+    let menu = Menu::new();
+    let mut presets: Vec<CheckMenuItem> = Vec::new();
+    for (i, (name, _)) in PRESETS.iter().enumerate() {
+        let item = CheckMenuItem::new(*name, true, i == DEFAULT_PRESET, None);
+        menu.append(&item).unwrap();
+        presets.push(item);
+    }
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+    // stepped option submenus; default checked = Medium/Normal/Unlimited/Off
+    let sub = |title: &str, names: &[&str], default: usize| -> Vec<CheckMenuItem> {
+        let submenu = Submenu::new(title, true);
+        let items: Vec<CheckMenuItem> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| CheckMenuItem::new(*n, true, i == default, None))
+            .collect();
+        for it in &items {
+            submenu.append(it).unwrap();
+        }
+        menu.append(&submenu).unwrap();
+        items
+    };
+    let sizes = sub("Size", &SIZES.map(|s| s.0), 1);
+    let speeds = sub("Speed", &SPEEDS.map(|s| s.0), 1);
+    let fps = sub("FPS", &FPS_OPTS.map(|s| s.0), 2);
+    let idles = sub("Screensaver", &IDLE_OPTS.map(|s| s.0), 0);
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+    let open_cfg = MenuItem::new("Open Config File", true, None);
+    menu.append(&open_cfg).unwrap();
+    let quit = MenuItem::new("Quit", true, None);
+    menu.append(&quit).unwrap();
+    let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32).unwrap();
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Singularity - right-click to change look and options")
+        .with_icon(icon)
+        .build()
+        .unwrap();
+    Tray {
+        _icon: tray,
+        presets,
+        sizes,
+        speeds,
+        fps,
+        idles,
+        open_cfg_id: open_cfg.id().clone(),
+        quit_id: quit.id().clone(),
+    }
+}
+
 fn main() {
     env_logger::init();
 
@@ -632,72 +718,9 @@ fn main() {
     #[cfg(any(windows, target_os = "macos"))]
     capture::start(shared.clone());
 
-    // ---- tray icon with preset + options menu (Windows: taskbar overflow / macOS: menu bar) ----
-    // sub-option values, shared by the menu and its handler
+    // created at StartCause::Init inside the event loop, see build_tray docs
     #[cfg(any(windows, target_os = "macos"))]
-    const SIZES: [(&str, f32); 3] = [("Small", 0.06), ("Medium", 0.09), ("Large", 0.14)];
-    #[cfg(any(windows, target_os = "macos"))]
-    const SPEEDS: [(&str, f32); 3] = [("Slow", 0.4), ("Normal", 1.0), ("Fast", 2.2)];
-    #[cfg(any(windows, target_os = "macos"))]
-    const FPS_OPTS: [(&str, u32); 3] = [("30", 30), ("60", 60), ("Unlimited", 0)];
-    #[cfg(any(windows, target_os = "macos"))]
-    const IDLE_OPTS: [(&str, f32); 4] =
-        [("Off", 0.0), ("1 min", 1.0), ("5 min", 5.0), ("10 min", 10.0)];
-    #[cfg(any(windows, target_os = "macos"))]
-    let (_tray, preset_items, size_items, speed_items, fps_items, idle_items, open_cfg_id, quit_id) = {
-        use tray_icon::{
-            menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
-            Icon, TrayIconBuilder,
-        };
-        let menu = Menu::new();
-        let mut items: Vec<CheckMenuItem> = Vec::new();
-        for (i, (name, _)) in PRESETS.iter().enumerate() {
-            let item = CheckMenuItem::new(*name, true, i == DEFAULT_PRESET, None);
-            menu.append(&item).unwrap();
-            items.push(item);
-        }
-        menu.append(&PredefinedMenuItem::separator()).unwrap();
-        // stepped option submenus; default checked = Medium/Normal/Unlimited
-        let mut sub = |title: &str, names: &[&str], default: usize| -> Vec<CheckMenuItem> {
-            let submenu = Submenu::new(title, true);
-            let items: Vec<CheckMenuItem> = names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| CheckMenuItem::new(*n, true, i == default, None))
-                .collect();
-            for it in &items {
-                submenu.append(it).unwrap();
-            }
-            menu.append(&submenu).unwrap();
-            items
-        };
-        let size_items = sub("Size", &SIZES.map(|s| s.0), 1);
-        let speed_items = sub("Speed", &SPEEDS.map(|s| s.0), 1);
-        let fps_items = sub("FPS", &FPS_OPTS.map(|s| s.0), 2);
-        let idle_items = sub("Screensaver", &IDLE_OPTS.map(|s| s.0), 0);
-        menu.append(&PredefinedMenuItem::separator()).unwrap();
-        let open_cfg = MenuItem::new("Open Config File", true, None);
-        menu.append(&open_cfg).unwrap();
-        let quit = MenuItem::new("Quit", true, None);
-        menu.append(&quit).unwrap();
-        let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32).unwrap();
-        let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("Singularity - right-click to change look and options")
-            .with_icon(icon)
-            .build()
-            .unwrap();
-        (
-            tray,
-            items,
-            size_items,
-            speed_items,
-            fps_items,
-            idle_items,
-            open_cfg.id().clone(),
-            quit.id().clone(),
-        )
-    };
+    let mut tray: Option<Tray> = None;
 
     // config-file hot-reload state
     let cfg_path = config_path();
@@ -730,6 +753,14 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
         .run(move |event, elwt| match event {
+            // NSStatusItem must be created after NSApplication is running on
+            // macOS; StartCause::Init is the first moment that is true.
+            Event::NewEvents(winit::event::StartCause::Init) => {
+                #[cfg(any(windows, target_os = "macos"))]
+                {
+                    tray = Some(build_tray());
+                }
+            }
             Event::WindowEvent { event, window_id } if window_id == state.window.id() => {
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
@@ -802,46 +833,48 @@ fn main() {
                 }
                 // tray menu events arrive on a global channel; poll each tick
                 #[cfg(any(windows, target_os = "macos"))]
-                while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-                    let check_one = |items: &[tray_icon::menu::CheckMenuItem], idx: usize| {
-                        for (j, it) in items.iter().enumerate() {
-                            it.set_checked(j == idx);
+                if let Some(t) = &tray {
+                    while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+                        let check_one = |items: &[tray_icon::menu::CheckMenuItem], idx: usize| {
+                            for (j, it) in items.iter().enumerate() {
+                                it.set_checked(j == idx);
+                            }
+                        };
+                        if ev.id == t.quit_id {
+                            elwt.exit();
+                        } else if ev.id == t.open_cfg_id {
+                            if let Some(path) = &cfg_path {
+                                ensure_config_file(path);
+                                #[cfg(windows)]
+                                let _ = std::process::Command::new("notepad").arg(path).spawn();
+                                #[cfg(target_os = "macos")]
+                                let _ = std::process::Command::new("open")
+                                    .arg("-t")
+                                    .arg(path)
+                                    .spawn();
+                            }
+                        } else if let Some(idx) =
+                            t.presets.iter().position(|it| it.id() == &ev.id)
+                        {
+                            state.set_preset(idx);
+                            check_one(&t.presets, idx);
+                        } else if let Some(idx) = t.sizes.iter().position(|it| it.id() == &ev.id)
+                        {
+                            state.hole_radius = SIZES[idx].1;
+                            check_one(&t.sizes, idx);
+                        } else if let Some(idx) =
+                            t.speeds.iter().position(|it| it.id() == &ev.id)
+                        {
+                            state.drift_speed = SPEEDS[idx].1;
+                            check_one(&t.speeds, idx);
+                        } else if let Some(idx) = t.fps.iter().position(|it| it.id() == &ev.id) {
+                            state.fps = FPS_OPTS[idx].1;
+                            check_one(&t.fps, idx);
+                        } else if let Some(idx) = t.idles.iter().position(|it| it.id() == &ev.id)
+                        {
+                            state.idle_minutes = IDLE_OPTS[idx].1;
+                            check_one(&t.idles, idx);
                         }
-                    };
-                    if ev.id == quit_id {
-                        elwt.exit();
-                    } else if ev.id == open_cfg_id {
-                        if let Some(path) = &cfg_path {
-                            ensure_config_file(path);
-                            #[cfg(windows)]
-                            let _ = std::process::Command::new("notepad").arg(path).spawn();
-                            #[cfg(target_os = "macos")]
-                            let _ = std::process::Command::new("open")
-                                .arg("-t")
-                                .arg(path)
-                                .spawn();
-                        }
-                    } else if let Some(idx) =
-                        preset_items.iter().position(|it| it.id() == &ev.id)
-                    {
-                        state.set_preset(idx);
-                        check_one(&preset_items, idx);
-                    } else if let Some(idx) = size_items.iter().position(|it| it.id() == &ev.id)
-                    {
-                        state.hole_radius = SIZES[idx].1;
-                        check_one(&size_items, idx);
-                    } else if let Some(idx) =
-                        speed_items.iter().position(|it| it.id() == &ev.id)
-                    {
-                        state.drift_speed = SPEEDS[idx].1;
-                        check_one(&speed_items, idx);
-                    } else if let Some(idx) = fps_items.iter().position(|it| it.id() == &ev.id) {
-                        state.fps = FPS_OPTS[idx].1;
-                        check_one(&fps_items, idx);
-                    } else if let Some(idx) = idle_items.iter().position(|it| it.id() == &ev.id)
-                    {
-                        state.idle_minutes = IDLE_OPTS[idx].1;
-                        check_one(&idle_items, idx);
                     }
                 }
 
@@ -862,8 +895,10 @@ fn main() {
                                         if let Some(i) = cfg.preset {
                                             state.set_preset(i);
                                             #[cfg(any(windows, target_os = "macos"))]
-                                            for (j, it) in preset_items.iter().enumerate() {
-                                                it.set_checked(j == i);
+                                            if let Some(t) = &tray {
+                                                for (j, it) in t.presets.iter().enumerate() {
+                                                    it.set_checked(j == i);
+                                                }
                                             }
                                         }
                                     }
