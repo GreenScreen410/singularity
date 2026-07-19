@@ -115,6 +115,15 @@ In screensaver mode the renderer is fully idle until the hole appears. It is
 still a continuous visual effect though, so expect some battery cost while
 the hole is on screen.
 
+## Why is it missing from my screenshots?
+
+The overlay excludes itself from screen capture: it captures the desktop
+itself, and without that exclusion it would see its own output and
+collapse into an infinite mirror. Windows applies the exclusion to still
+screenshots (Print Screen, Snipping Tool), so the hole will not appear in
+them. Screen recording does pick it up (the demo above is a plain screen
+recording), so use video when you want to show it off.
+
 ## A note on Windows SmartScreen
 
 Release binaries are not code-signed (certificates are priced for companies,
