@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Event, KeyEvent, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
     keyboard::{Key, NamedKey},
     window::{Window, WindowBuilder, WindowLevel},
 };
@@ -168,12 +168,13 @@ const DEFAULT_CONFIG: &str = "\
 
 # Placement: hold Ctrl+Shift anywhere and the hole follows your mouse;
 # release to pin it. Tray > Position > Auto drift resumes wandering.
-# Or pin a fixed spot here (0 to 1, fraction of the screen).
+# Or pin a fixed spot here (0 to 1, fraction of the combined desktop).
 #pin_x = 0.5
 #pin_y = 0.5
 
-# Which monitor the hole lives on (1 = first). Also in the tray menu.
-#monitor = 1
+# Monitors: 0 = roam across all of them (default), N = stay on monitor N.
+# Also in the tray menu.
+#monitor = 0
 ";
 
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -185,24 +186,48 @@ fn ensure_config_file(path: &std::path::Path) {
     }
 }
 
-struct State {
+/// One overlay window on one monitor: its surface, its capture session and
+/// its share of the zero-copy machinery. The hole itself lives in State in
+/// virtual-desktop coordinates; every pane renders it from its own viewpoint,
+/// which is what lets it roam seamlessly across monitor boundaries.
+struct Pane {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    size: PhysicalSize<u32>,
-    pipeline: wgpu::RenderPipeline,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    mon_index: usize,
+    mon_pos: PhysicalPosition<i32>,
+    mon_size: PhysicalSize<u32>,
+    shared: Shared,
     uniform_buf: wgpu::Buffer,
-    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
-    sampler: wgpu::Sampler,
     desktop_texture: wgpu::Texture,
     tex_size: (u32, u32),
-    shared: Shared,
     last_version: u64,
     has_desktop: bool,
-    overlay_visible: bool,
+    visible: bool,
+    #[cfg(windows)]
+    last_epoch: u64,
+    #[cfg(windows)]
+    gpu_share: Option<gpu_share::GpuShare>,
+    #[cfg(windows)]
+    gpu_bind_groups: Vec<wgpu::BindGroup>,
+    #[cfg(windows)]
+    gpu_attempted: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    gpu_current: Option<usize>,
+}
+
+struct State {
+    instance: wgpu::Instance,
+    _adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::RenderPipeline,
+    format: wgpu::TextureFormat,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    panes: Vec<Pane>,
     start: std::time::Instant,
     look_from: [f32; 14],
     look_to: [f32; 14],
@@ -214,34 +239,22 @@ struct State {
     fps: u32,          // 0 = uncapped (vsync only)
     idle_minutes: f32, // 0 = always visible; >0 = appear after this much idle
     appear_start: Option<std::time::Instant>, // grow-in animation anchor
-    // hole placement: smoothed centre, plus Some(uv) when pinned in place
-    mon_pos: PhysicalPosition<i32>,
-    mon_size: PhysicalSize<u32>,
-    center: [f32; 2],
-    pinned: Option<[f32; 2]>,
+    // hole placement in virtual-desktop pixels: the roam box is the bounding
+    // box of the selected monitors, the centre is smoothed toward its target
+    roam_pos: [f64; 2],
+    roam_size: [f64; 2],
+    primary_h: f64, // hole size reference so it stays constant across panes
+    center_px: [f64; 2],
+    pinned_px: Option<[f64; 2]>,
     last_center_tick: std::time::Instant,
-    #[cfg(windows)]
-    last_epoch: u64,
-    // zero-copy capture path (Windows): shared textures + their bind groups
-    #[cfg(windows)]
-    gpu_share: Option<gpu_share::GpuShare>,
-    #[cfg(windows)]
-    gpu_bind_groups: Vec<wgpu::BindGroup>,
-    #[cfg(windows)]
-    gpu_attempted: bool,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    gpu_current: Option<usize>,
 }
 
 impl State {
     async fn new(
-        window: Arc<Window>,
-        shared: Shared,
-        mon_pos: PhysicalPosition<i32>,
-        mon_size: PhysicalSize<u32>,
+        target: &EventLoopWindowTarget<()>,
+        monitors: &[winit::monitor::MonitorHandle],
+        selection: Option<usize>, // None = every monitor
     ) -> State {
-        let size = window.inner_size();
-
         // Windows must be DX12 (the zero-copy capture path shares D3D12
         // textures); macOS is Metal; elsewhere let Vulkan/GL race.
         #[cfg(windows)]
@@ -254,7 +267,10 @@ impl State {
             backends,
             ..Default::default()
         });
-        let surface = instance.create_surface(window.clone()).unwrap();
+
+        // hidden window + surface shells for every selected monitor
+        let shells = make_shells(&instance, target, monitors, selection);
+
         // On hybrid-GPU laptops the capture's D3D11 device lives on the
         // DEFAULT adapter (usually the iGPU) while HighPerformance would pick
         // the dGPU, and shared textures cannot cross adapters. Prefer the
@@ -277,7 +293,7 @@ impl State {
                 None => instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference: wgpu::PowerPreference::HighPerformance,
-                        compatible_surface: Some(&surface),
+                        compatible_surface: shells.first().map(|s| &s.surface),
                         force_fallback_adapter: false,
                     })
                     .await
@@ -288,7 +304,7 @@ impl State {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
+                compatible_surface: shells.first().map(|s| &s.surface),
                 force_fallback_adapter: false,
             })
             .await
@@ -298,31 +314,19 @@ impl State {
             .await
             .expect("failed to create device");
 
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // one pipeline for all panes; the format is the first surface's
+        // preference (universally Bgra8UnormSrgb on Windows/macOS)
+        let format = shells
+            .first()
+            .map(|s| {
+                let caps = s.surface.get_capabilities(&adapter);
+                caps.formats
+                    .iter()
+                    .copied()
+                    .find(|f| f.is_srgb())
+                    .unwrap_or(caps.formats[0])
+            })
+            .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("sampler"),
@@ -367,15 +371,6 @@ impl State {
             ],
         });
 
-        let desktop_texture = create_desktop_texture(&device, 1, 1);
-        let bind_group = make_bind_group(
-            &device,
-            &bind_group_layout,
-            &uniform_buf,
-            &desktop_texture,
-            &sampler,
-        );
-
         let shader = device.create_shader_module(wgpu::include_wgsl!("singularity.wgsl"));
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline layout"),
@@ -395,7 +390,7 @@ impl State {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -408,24 +403,20 @@ impl State {
             cache: None,
         });
 
-        State {
-            window,
-            surface,
+        let primary_h = monitors
+            .first()
+            .map(|m| m.size().height as f64)
+            .unwrap_or(1080.0);
+        let mut state = State {
+            instance,
+            _adapter: adapter,
             device,
             queue,
-            config,
-            size,
             pipeline,
-            uniform_buf,
+            format,
             bind_group_layout,
-            bind_group,
             sampler,
-            desktop_texture,
-            tex_size: (1, 1),
-            shared,
-            last_version: 0,
-            has_desktop: false,
-            overlay_visible: false,
+            panes: Vec::new(),
             start: std::time::Instant::now(),
             look_from: PRESETS[DEFAULT_PRESET].1,
             look_to: PRESETS[DEFAULT_PRESET].1,
@@ -437,68 +428,140 @@ impl State {
             fps: 0,
             idle_minutes: 0.0,
             appear_start: None,
-            mon_pos,
-            mon_size,
-            center: [0.5, 0.5],
-            pinned: None,
+            roam_pos: [0.0, 0.0],
+            roam_size: [1.0, 1.0],
+            primary_h,
+            center_px: [0.0, 0.0],
+            pinned_px: None,
             last_center_tick: std::time::Instant::now(),
-            #[cfg(windows)]
-            last_epoch: 0,
-            #[cfg(windows)]
-            gpu_share: None,
-            #[cfg(windows)]
-            gpu_bind_groups: Vec::new(),
-            #[cfg(windows)]
-            gpu_attempted: false,
-            gpu_current: None,
+        };
+        state.finish_panes(shells);
+        state.update_roam_box();
+        state.center_px = [
+            state.roam_pos[0] + state.roam_size[0] * 0.5,
+            state.roam_pos[1] + state.roam_size[1] * 0.5,
+        ];
+        state
+    }
+
+    /// Turn shells into full panes: configure the surface, create per-pane
+    /// resources, start that monitor's capture, then apply the overlay styles
+    /// (they must come after the swapchain exists, see main()).
+    fn finish_panes(&mut self, shells: Vec<Shell>) {
+        for shell in shells {
+            let Shell {
+                window,
+                surface,
+                mon_index,
+                mon_pos,
+                mon_size,
+            } = shell;
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: self.format,
+                width: mon_size.width.max(1),
+                height: mon_size.height.max(1),
+                present_mode: wgpu::PresentMode::AutoVsync,
+                alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                view_formats: vec![],
+                desired_maximum_frame_latency: 2,
+            };
+            surface.configure(&self.device, &config);
+
+            let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("uniforms"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let desktop_texture = create_desktop_texture(&self.device, 1, 1);
+            let bind_group = make_bind_group(
+                &self.device,
+                &self.bind_group_layout,
+                &uniform_buf,
+                &desktop_texture,
+                &self.sampler,
+            );
+
+            let shared: Shared = Arc::new(Mutex::new(SharedFrame {
+                monitor_index: mon_index,
+                ..Default::default()
+            }));
+            #[cfg(any(windows, target_os = "macos"))]
+            capture::start(shared.clone(), mon_index);
+
+            // overlay styles only after the swapchain exists (layered-window
+            // rule); the window is still hidden at this point
+            let _ = window.set_cursor_hittest(false);
+            #[cfg(any(windows, target_os = "macos"))]
+            set_capture_exclusion(&window, true);
+
+            self.panes.push(Pane {
+                window,
+                surface,
+                config,
+                mon_index,
+                mon_pos,
+                mon_size,
+                shared,
+                uniform_buf,
+                bind_group,
+                desktop_texture,
+                tex_size: (1, 1),
+                last_version: 0,
+                has_desktop: false,
+                visible: false,
+                #[cfg(windows)]
+                last_epoch: 0,
+                #[cfg(windows)]
+                gpu_share: None,
+                #[cfg(windows)]
+                gpu_bind_groups: Vec::new(),
+                #[cfg(windows)]
+                gpu_attempted: false,
+                gpu_current: None,
+            });
         }
     }
 
-    /// One-shot attempt to set up the zero-copy path once the capture size is
-    /// known. On failure the capture thread keeps feeding CPU frames.
-    #[cfg(windows)]
-    fn try_setup_gpu_share(&mut self) {
-        if self.gpu_attempted {
-            return;
+    /// The union bounding box of the selected monitors, in virtual pixels.
+    fn update_roam_box(&mut self) {
+        let mut min = [f64::MAX, f64::MAX];
+        let mut max = [f64::MIN, f64::MIN];
+        for p in &self.panes {
+            min[0] = min[0].min(p.mon_pos.x as f64);
+            min[1] = min[1].min(p.mon_pos.y as f64);
+            max[0] = max[0].max(p.mon_pos.x as f64 + p.mon_size.width as f64);
+            max[1] = max[1].max(p.mon_pos.y as f64 + p.mon_size.height as f64);
         }
-        let (w, h, already, disabled) = {
-            let g = self.shared.lock().unwrap();
-            (g.width, g.height, g.gpu_handles.is_some(), g.gpu_disabled)
-        };
-        if disabled {
-            self.gpu_attempted = true;
-            return;
+        if self.panes.is_empty() {
+            min = [0.0, 0.0];
+            max = [1920.0, 1080.0];
         }
-        if already || w == 0 || h == 0 {
-            return; // no frame yet
+        self.roam_pos = min;
+        self.roam_size = [(max[0] - min[0]).max(1.0), (max[1] - min[1]).max(1.0)];
+    }
+
+    /// Tear the panes down and rebuild them for a new monitor selection.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    fn set_selection(
+        &mut self,
+        target: &EventLoopWindowTarget<()>,
+        monitors: &[winit::monitor::MonitorHandle],
+        selection: Option<usize>,
+    ) {
+        for p in &self.panes {
+            // sentinel: tells that pane's capture thread to shut down
+            p.shared.lock().unwrap().monitor_index = usize::MAX;
         }
-        self.gpu_attempted = true;
-        match gpu_share::create(&self.device, w, h) {
-            Ok(share) => {
-                self.gpu_bind_groups = share
-                    .textures
-                    .iter()
-                    .map(|t| {
-                        make_bind_group(
-                            &self.device,
-                            &self.bind_group_layout,
-                            &self.uniform_buf,
-                            t,
-                            &self.sampler,
-                        )
-                    })
-                    .collect();
-                let mut g = self.shared.lock().unwrap();
-                g.gpu_size = (w, h);
-                g.gpu_handles = Some(share.handles);
-                self.gpu_share = Some(share);
-                eprintln!("render: shared GPU textures ready ({w}x{h})");
-            }
-            Err(e) => {
-                eprintln!("render: GPU sharing unavailable ({e}); using CPU path");
-                self.shared.lock().unwrap().gpu_disabled = true;
-            }
-        }
+        self.panes.clear();
+        let shells = make_shells(&self.instance, target, monitors, selection);
+        self.finish_panes(shells);
+        self.update_roam_box();
+        self.center_px = [
+            self.roam_pos[0] + self.roam_size[0] * 0.5,
+            self.roam_pos[1] + self.roam_size[1] * 0.5,
+        ];
     }
 
     /// Current look: smoothstep crossfade from look_from to look_to.
@@ -512,20 +575,18 @@ impl State {
         out
     }
 
-    /// Current global cursor position mapped into this monitor's uv space.
+    /// Global cursor position in virtual-desktop pixels.
     #[cfg(windows)]
-    fn cursor_uv(&self) -> Option<[f32; 2]> {
+    fn cursor_px(&self) -> Option<[f64; 2]> {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
         let mut p = POINT::default();
         unsafe { GetCursorPos(&mut p).ok()? };
-        let x = (p.x - self.mon_pos.x) as f32 / self.mon_size.width.max(1) as f32;
-        let y = (p.y - self.mon_pos.y) as f32 / self.mon_size.height.max(1) as f32;
-        Some([x.clamp(0.02, 0.98), y.clamp(0.02, 0.98)])
+        Some([p.x as f64, p.y as f64])
     }
 
     #[cfg(target_os = "macos")]
-    fn cursor_uv(&self) -> Option<[f32; 2]> {
+    fn cursor_px(&self) -> Option<[f64; 2]> {
         #[repr(C)]
         struct CGPoint {
             x: f64,
@@ -547,62 +608,58 @@ impl State {
             }
             let loc = CGEventGetLocation(ev); // global, top-left origin, points
             CFRelease(ev);
-            let scale = self.window.scale_factor();
-            let x = (loc.x * scale - self.mon_pos.x as f64) / self.mon_size.width.max(1) as f64;
-            let y = (loc.y * scale - self.mon_pos.y as f64) / self.mon_size.height.max(1) as f64;
-            Some([(x as f32).clamp(0.02, 0.98), (y as f32).clamp(0.02, 0.98)])
+            let scale = self
+                .panes
+                .first()
+                .map(|p| p.window.scale_factor())
+                .unwrap_or(1.0);
+            Some([loc.x * scale, loc.y * scale])
         }
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
-    fn cursor_uv(&self) -> Option<[f32; 2]> {
+    fn cursor_px(&self) -> Option<[f64; 2]> {
         None
+    }
+
+    fn clamp_roam(&self, p: [f64; 2]) -> [f64; 2] {
+        let mx = self.roam_size[0] * 0.02;
+        let my = self.roam_size[1] * 0.02;
+        [
+            p[0].clamp(self.roam_pos[0] + mx, self.roam_pos[0] + self.roam_size[0] - mx),
+            p[1].clamp(self.roam_pos[1] + my, self.roam_pos[1] + self.roam_size[1] - my),
+        ]
     }
 
     /// Advance the hole centre: follow the cursor while the placement hotkey
     /// is held (pinning where it lands), else glide toward the pin or the
-    /// Lissajous drift path.
+    /// Lissajous drift path over the whole roam box.
     fn tick_center(&mut self) {
         let now = std::time::Instant::now();
         let dt = (now - self.last_center_tick).as_secs_f32().min(0.1);
         self.last_center_tick = now;
 
         if place_hotkey_held() {
-            if let Some(uv) = self.cursor_uv() {
-                self.pinned = Some(uv);
+            if let Some(p) = self.cursor_px() {
+                self.pinned_px = Some(self.clamp_roam(p));
             }
         }
-        let target = match self.pinned {
+        let target = match self.pinned_px {
             Some(p) => p,
             None => {
                 let t = self.start.elapsed().as_secs_f32() * 0.12 * self.drift_speed;
                 let l = lissa(t);
-                [0.5 + l[0] * self.drift_x, 0.5 + l[1] * self.drift_y]
+                [
+                    self.roam_pos[0]
+                        + self.roam_size[0] * (0.5 + l[0] as f64 * self.drift_x as f64),
+                    self.roam_pos[1]
+                        + self.roam_size[1] * (0.5 + l[1] as f64 * self.drift_y as f64),
+                ]
             }
         };
-        let k = 1.0 - (-dt * 6.0).exp();
-        self.center[0] += (target[0] - self.center[0]) * k;
-        self.center[1] += (target[1] - self.center[1]) * k;
-    }
-
-    /// Move the overlay (and the capture) to another monitor. The window has
-    /// to shed its layered styles while the swapchain resizes, because DXGI
-    /// refuses to rebuild one on a layered window.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-    fn set_monitor(&mut self, index: usize, pos: PhysicalPosition<i32>, size: PhysicalSize<u32>) {
-        self.mon_pos = pos;
-        self.mon_size = size;
-        let _ = self.window.set_cursor_hittest(true);
-        #[cfg(any(windows, target_os = "macos"))]
-        set_capture_exclusion(&self.window, false);
-        self.window.set_outer_position(pos);
-        let _ = self.window.request_inner_size(size);
-        self.resize(size);
-        let _ = self.window.set_cursor_hittest(false);
-        #[cfg(any(windows, target_os = "macos"))]
-        set_capture_exclusion(&self.window, true);
-        self.shared.lock().unwrap().monitor_index = index;
-        self.center = [0.5, 0.5];
+        let k = (1.0 - (-dt * 6.0).exp()) as f64;
+        self.center_px[0] += (target[0] - self.center_px[0]) * k;
+        self.center_px[1] += (target[1] - self.center_px[1]) * k;
     }
 
     /// Screensaver grow-in: 0 -> 1 over ~2 s after the overlay appears from
@@ -625,61 +682,58 @@ impl State {
         self.fade_start = std::time::Instant::now();
     }
 
-    fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        // Skip no-op reconfigures: after startup the window is layered (the
-        // capture-exclusion flag does that) and a DX12 swapchain rebuild on a
-        // layered window fails, so only reconfigure when the size really
-        // changed (which for a fullscreen overlay is a display-mode change).
+    fn resize_pane(&mut self, i: usize, new_size: PhysicalSize<u32>) {
+        // Skip no-op reconfigures: the window is layered after startup and a
+        // DX12 swapchain rebuild on a layered window fails.
+        let device = &self.device;
+        let pane = &mut self.panes[i];
         if new_size.width > 0
             && new_size.height > 0
-            && (new_size.width != self.config.width || new_size.height != self.config.height)
+            && (new_size.width != pane.config.width || new_size.height != pane.config.height)
         {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
+            pane.config.width = new_size.width;
+            pane.config.height = new_size.height;
+            pane.surface.configure(device, &pane.config);
         }
     }
 
-    /// Unconditional reconfigure, for surface Lost/Outdated recovery.
-    fn reconfigure(&mut self) {
-        self.surface.configure(&self.device, &self.config);
-    }
+    /// Per-pane update: ingest the newest capture frame and write uniforms.
+    fn update_pane(&mut self, i: usize) {
+        let look = self.current_look();
+        let radius_ref = self.hole_radius * self.appear_factor();
+        let time = self.start.elapsed().as_secs_f32();
+        let center_px = self.center_px;
+        let primary_h = self.primary_h;
 
-    fn update(&mut self) {
-        // capture session restarted (monitor switch): renegotiate GPU sharing
+        // zero-copy maintenance wants disjoint borrows; do it via free fns
         #[cfg(windows)]
         {
-            let ep = self.shared.lock().unwrap().epoch;
-            if ep != self.last_epoch {
-                self.last_epoch = ep;
-                self.gpu_share = None;
-                self.gpu_bind_groups.clear();
-                self.gpu_attempted = false;
-                self.gpu_current = None;
-                self.has_desktop = false;
-            }
+            let device = &self.device;
+            let layout = &self.bind_group_layout;
+            let sampler = &self.sampler;
+            let pane = &mut self.panes[i];
+            pane_gpu_maintenance(device, layout, sampler, pane);
         }
-        #[cfg(windows)]
-        self.try_setup_gpu_share();
 
-        self.tick_center();
+        let queue = &self.queue;
+        let device = &self.device;
+        let layout = &self.bind_group_layout;
+        let sampler = &self.sampler;
+        let pane = &mut self.panes[i];
 
-        // Pull the latest desktop frame. Zero-copy mode just names a shared
-        // GPU texture; CPU mode copies the bytes out of the lock so we don't
-        // hold it during the texture upload.
+        // pull the latest desktop frame for this pane
         let frame = {
-            let g = self.shared.lock().unwrap();
-            if g.version != self.last_version && g.width > 0 && g.height > 0 {
-                self.last_version = g.version;
+            let g = pane.shared.lock().unwrap();
+            if g.version != pane.last_version && g.width > 0 && g.height > 0 {
+                pane.last_version = g.version;
                 match g.gpu_index {
-                    Some(i) => {
-                        self.gpu_current = Some(i);
-                        self.has_desktop = true;
+                    Some(gi) => {
+                        pane.gpu_current = Some(gi);
+                        pane.has_desktop = true;
                         None
                     }
                     None => {
-                        self.gpu_current = None;
+                        pane.gpu_current = None;
                         Some((g.width, g.height, g.data.clone()))
                     }
                 }
@@ -688,20 +742,20 @@ impl State {
             }
         };
         if let Some((w, h, data)) = frame {
-            if (w, h) != self.tex_size {
-                self.desktop_texture = create_desktop_texture(&self.device, w, h);
-                self.bind_group = make_bind_group(
-                    &self.device,
-                    &self.bind_group_layout,
-                    &self.uniform_buf,
-                    &self.desktop_texture,
-                    &self.sampler,
+            if (w, h) != pane.tex_size {
+                pane.desktop_texture = create_desktop_texture(device, w, h);
+                pane.bind_group = make_bind_group(
+                    device,
+                    layout,
+                    &pane.uniform_buf,
+                    &pane.desktop_texture,
+                    sampler,
                 );
-                self.tex_size = (w, h);
+                pane.tex_size = (w, h);
             }
-            self.queue.write_texture(
+            queue.write_texture(
                 wgpu::ImageCopyTexture {
-                    texture: &self.desktop_texture,
+                    texture: &pane.desktop_texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -718,30 +772,40 @@ impl State {
                     depth_or_array_layers: 1,
                 },
             );
-            self.has_desktop = true;
+            pane.has_desktop = true;
         }
 
         let u = Uniforms {
-            resolution: [self.config.width as f32, self.config.height as f32],
-            time: self.start.elapsed().as_secs_f32(),
-            has_desktop: if self.has_desktop { 1.0 } else { 0.0 },
-            look: self.current_look(),
-            hole_radius: self.hole_radius * self.appear_factor(),
-            center: self.center,
+            resolution: [pane.config.width as f32, pane.config.height as f32],
+            time,
+            has_desktop: if pane.has_desktop { 1.0 } else { 0.0 },
+            look,
+            // the hole keeps one physical size everywhere: radius is relative
+            // to the primary monitor's height, rescaled per pane
+            hole_radius: radius_ref
+                * (primary_h as f32 / pane.mon_size.height.max(1) as f32),
+            center: [
+                ((center_px[0] - pane.mon_pos.x as f64) / pane.mon_size.width.max(1) as f64)
+                    as f32,
+                ((center_px[1] - pane.mon_pos.y as f64) / pane.mon_size.height.max(1) as f64)
+                    as f32,
+            ],
             _pad: [0.0; 3],
         };
-        self.queue
-            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(&pane.uniform_buf, 0, bytemuck::bytes_of(&u));
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.surface.get_current_texture()?;
+    fn render_pane(&mut self, i: usize) -> Result<(), wgpu::SurfaceError> {
+        let pipeline = &self.pipeline;
+        let device = &self.device;
+        let queue = &self.queue;
+        let pane = &mut self.panes[i];
+        let frame = pane.surface.get_current_texture()?;
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("encoder") });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("encoder") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
@@ -757,26 +821,133 @@ impl State {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(pipeline);
             // zero-copy mode samples the shared texture's bind group directly
             let bg: &wgpu::BindGroup;
             #[cfg(windows)]
             {
-                bg = match self.gpu_current {
-                    Some(i) if i < self.gpu_bind_groups.len() => &self.gpu_bind_groups[i],
-                    _ => &self.bind_group,
+                bg = match pane.gpu_current {
+                    Some(gi) if gi < pane.gpu_bind_groups.len() => &pane.gpu_bind_groups[gi],
+                    _ => &pane.bind_group,
                 };
             }
             #[cfg(not(windows))]
             {
-                bg = &self.bind_group;
+                bg = &pane.bind_group;
             }
             pass.set_bind_group(0, bg, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit(Some(encoder.finish()));
+        queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+}
+
+/// A freshly created hidden window + surface on one monitor, not yet a Pane.
+struct Shell {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    mon_index: usize,
+    mon_pos: PhysicalPosition<i32>,
+    mon_size: PhysicalSize<u32>,
+}
+
+/// Manual borderless "fullscreen" per monitor: undecorated topmost windows
+/// sized and placed by hand. winit's Fullscreen::Borderless state makes DXGI
+/// swapchain creation fail with DXGI_ERROR_INVALID_CALL (verified by
+/// examples/dx12_probe.rs), while a manually monitor-sized window works.
+fn make_shells(
+    instance: &wgpu::Instance,
+    target: &EventLoopWindowTarget<()>,
+    monitors: &[winit::monitor::MonitorHandle],
+    selection: Option<usize>,
+) -> Vec<Shell> {
+    let indices: Vec<usize> = match selection {
+        Some(i) if i < monitors.len() => vec![i],
+        _ => (0..monitors.len()).collect(),
+    };
+    let mut shells = Vec::new();
+    for i in indices {
+        let m = &monitors[i];
+        let (pos, size) = (m.position(), m.size());
+        let window = Arc::new(
+            WindowBuilder::new()
+                .with_title("Singularity")
+                .with_decorations(false)
+                .with_window_level(WindowLevel::AlwaysOnTop)
+                .with_inner_size(size)
+                .with_position(pos)
+                .with_visible(false) // hidden until its first frame is ready
+                .build(target)
+                .unwrap(),
+        );
+        let surface = instance.create_surface(window.clone()).unwrap();
+        shells.push(Shell {
+            window,
+            surface,
+            mon_index: i,
+            mon_pos: pos,
+            mon_size: size,
+        });
+    }
+    shells
+}
+
+/// Zero-copy upkeep for one pane: renegotiate after a capture session restart
+/// and set up the shared textures once the capture size is known.
+#[cfg(windows)]
+fn pane_gpu_maintenance(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    pane: &mut Pane,
+) {
+    let ep = pane.shared.lock().unwrap().epoch;
+    if ep != pane.last_epoch {
+        pane.last_epoch = ep;
+        pane.gpu_share = None;
+        pane.gpu_bind_groups.clear();
+        pane.gpu_attempted = false;
+        pane.gpu_current = None;
+        pane.has_desktop = false;
+    }
+    if pane.gpu_attempted {
+        return;
+    }
+    let (w, h, already, disabled) = {
+        let g = pane.shared.lock().unwrap();
+        (g.width, g.height, g.gpu_handles.is_some(), g.gpu_disabled)
+    };
+    if disabled {
+        pane.gpu_attempted = true;
+        return;
+    }
+    if already || w == 0 || h == 0 {
+        return; // no frame yet
+    }
+    pane.gpu_attempted = true;
+    match gpu_share::create(device, w, h) {
+        Ok(share) => {
+            pane.gpu_bind_groups = share
+                .textures
+                .iter()
+                .map(|t| make_bind_group(device, layout, &pane.uniform_buf, t, sampler))
+                .collect();
+            let mut g = pane.shared.lock().unwrap();
+            g.gpu_size = (w, h);
+            g.gpu_handles = Some(share.handles);
+            pane.gpu_share = Some(share);
+            eprintln!(
+                "render: shared GPU textures ready for monitor {} ({w}x{h})",
+                pane.mon_index + 1
+            );
+        }
+        Err(e) => {
+            eprintln!("render: GPU sharing unavailable ({e}); using CPU path");
+            pane.shared.lock().unwrap().gpu_disabled = true;
+        }
     }
 }
 
@@ -1174,8 +1345,6 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
 fn main() {
     env_logger::init();
 
-    let shared: Shared = Arc::new(Mutex::new(SharedFrame::default()));
-
     // config-file state; read once now for startup-only decisions
     let cfg_path = config_path();
     let startup_cfg = cfg_path
@@ -1189,33 +1358,25 @@ fn main() {
     let mut boot_warned = false;
 
     let event_loop = EventLoop::new().unwrap();
-    // Manual borderless "fullscreen": an undecorated window sized and placed
-    // over the monitor by hand. winit's Fullscreen::Borderless state makes
-    // DXGI swapchain creation fail with DXGI_ERROR_INVALID_CALL (verified by
-    // examples/dx12_probe.rs), while a manually monitor-sized window works.
     let monitors: Vec<_> = event_loop.available_monitors().collect();
-    let mon_index = startup_cfg
-        .monitor
-        .map(|m| m.saturating_sub(1))
-        .filter(|i| *i < monitors.len())
-        .or_else(|| {
-            // index of the primary monitor within the enumeration
-            let primary = event_loop.primary_monitor()?;
-            monitors.iter().position(|m| *m == primary)
-        })
-        .unwrap_or(0);
-    let (mon_size, mon_pos) = monitors
-        .get(mon_index)
-        .map(|m| (m.size(), m.position()))
-        .unwrap_or((PhysicalSize::new(1920, 1080), PhysicalPosition::new(0, 0)));
-    shared.lock().unwrap().monitor_index = mon_index;
 
-    #[cfg(any(windows, target_os = "macos"))]
-    capture::start(shared.clone());
-
-    // created at StartCause::Init inside the event loop, see build_tray docs
-    #[cfg(any(windows, target_os = "macos"))]
-    let mut tray: Option<Tray> = None;
+    // monitor selection: 0 or absent = all monitors (the hole roams across
+    // them), N = confined to monitor N
+    let mon_count = monitors.len();
+    let sel_from_cfg = move |m: Option<usize>| -> Option<usize> {
+        match m {
+            Some(0) | None => None,
+            Some(n) => {
+                let i = n - 1;
+                if i < mon_count {
+                    Some(i)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    let mut current_sel = sel_from_cfg(startup_cfg.monitor);
 
     // daily update check (config: check_updates = 0 opts out, read at startup)
     #[cfg(any(windows, target_os = "macos"))]
@@ -1227,24 +1388,11 @@ fn main() {
     #[cfg(any(windows, target_os = "macos"))]
     let mut update_item: Option<tray_icon::menu::MenuItem> = None;
 
-    let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("Singularity")
-            .with_decorations(false)
-            .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_inner_size(mon_size)
-            .with_position(mon_pos)
-            .with_visible(false) // stay hidden until the first frame is ready
-            .build(&event_loop)
-            .unwrap(),
-    );
+    // created at StartCause::Init inside the event loop, see build_tray docs
+    #[cfg(any(windows, target_os = "macos"))]
+    let mut tray: Option<Tray> = None;
 
-    let mut state = pollster::block_on(State::new(
-        window.clone(),
-        shared.clone(),
-        mon_pos,
-        mon_size,
-    ));
+    let mut state = pollster::block_on(State::new(&event_loop, &monitors, current_sel));
 
     // apply the rest of the startup config and make hot-reload diff from it
     if let Some(i) = startup_cfg.preset {
@@ -1269,26 +1417,17 @@ fn main() {
         state.idle_minutes = v;
     }
     if let (Some(x), Some(y)) = (startup_cfg.pin_x, startup_cfg.pin_y) {
-        state.pinned = Some([x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)]);
+        // pin coordinates are fractions of the roam box
+        state.pinned_px = Some([
+            state.roam_pos[0] + state.roam_size[0] * x.clamp(0.0, 1.0) as f64,
+            state.roam_pos[1] + state.roam_size[1] * y.clamp(0.0, 1.0) as f64,
+        ]);
     }
     let mut prev_cfg = startup_cfg;
 
     // ui-side trackers for the event loop
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused))]
-    let mut current_monitor = mon_index;
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused))]
-    let mut tray_pinned_ui = state.pinned.is_some();
-
-    // Click-through and capture exclusion must both come AFTER the first
-    // surface configuration: each one turns the window into a layered window
-    // (winit maps hittest(false) to WS_EX_TRANSPARENT | WS_EX_LAYERED, and
-    // SetWindowDisplayAffinity adds WS_EX_LAYERED implicitly), and DXGI
-    // refuses to CREATE a flip-model swapchain on a layered window
-    // (0x887A0001). Presenting to one that became layered afterwards is
-    // fine; this create-then-flag order is the standard D3D overlay pattern.
-    let _ = window.set_cursor_hittest(false);
-    #[cfg(any(windows, target_os = "macos"))]
-    set_capture_exclusion(&window, true);
+    let mut tray_pinned_ui = state.pinned_px.is_some();
 
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
@@ -1298,17 +1437,22 @@ fn main() {
             Event::NewEvents(winit::event::StartCause::Init) => {
                 #[cfg(any(windows, target_os = "macos"))]
                 {
-                    let labels: Vec<String> = monitors
-                        .iter()
-                        .enumerate()
-                        .map(|(i, m)| {
-                            format!("{}: {}x{}", i + 1, m.size().width, m.size().height)
-                        })
-                        .collect();
-                    tray = Some(build_tray(&labels, current_monitor, state.pinned.is_some()));
+                    let mut labels = vec!["All monitors".to_string()];
+                    labels.extend(monitors.iter().enumerate().map(|(i, m)| {
+                        format!("{}: {}x{}", i + 1, m.size().width, m.size().height)
+                    }));
+                    let checked = match current_sel {
+                        None => 0,
+                        Some(i) => i + 1,
+                    };
+                    tray = Some(build_tray(&labels, checked, state.pinned_px.is_some()));
                 }
             }
-            Event::WindowEvent { event, window_id } if window_id == state.window.id() => {
+            Event::WindowEvent { event, window_id } => {
+                let Some(i) = state.panes.iter().position(|p| p.window.id() == window_id)
+                else {
+                    return;
+                };
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::KeyboardInput {
@@ -1320,13 +1464,15 @@ fn main() {
                             },
                         ..
                     } => elwt.exit(),
-                    WindowEvent::Resized(new_size) => state.resize(new_size),
+                    WindowEvent::Resized(new_size) => state.resize_pane(i, new_size),
                     WindowEvent::RedrawRequested => {
-                        state.update();
-                        match state.render() {
+                        state.update_pane(i);
+                        match state.render_pane(i) {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                state.reconfigure();
+                                let device = &state.device;
+                                let pane = &state.panes[i];
+                                pane.surface.configure(device, &pane.config);
                             }
                             Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
                             Err(e) => eprintln!("render error: {e:?}"),
@@ -1336,48 +1482,51 @@ fn main() {
                 }
             }
             Event::AboutToWait => {
-                // Visibility state machine. This must live HERE, not in
-                // render(): a hidden window gets no WM_PAINT, so render()
-                // never runs while hidden and a render-side reveal would
-                // deadlock into an invisible app.
+                state.tick_center();
+
+                // Visibility state machine, per pane. This must live HERE,
+                // not in the render path: a hidden window gets no WM_PAINT,
+                // so a render-side reveal would deadlock into invisibility.
                 //
-                // booted:  first capture frame arrived (or 3s fallback)
+                // booted:  that pane's first capture frame arrived (or 3s)
                 // wanted:  always, or only after idle_minutes without input
-                let ready = { shared.lock().unwrap().width > 0 };
                 let waited = state.start.elapsed().as_secs_f32();
-                let booted = ready || waited > 3.0;
-                if booted && !ready && !boot_warned {
-                    boot_warned = true;
-                    eprintln!(
-                        "warning: no capture frame after {waited:.1}s - \
-                         showing test pattern; check 'capture:' messages above"
-                    );
-                }
                 let idle_mode = state.idle_minutes > 0.0;
-                let wanted =
-                    booted && (!idle_mode || idle_seconds() >= state.idle_minutes * 60.0);
-                if wanted && !state.overlay_visible {
-                    // grow in from nothing when appearing out of idleness
-                    state.appear_start = if idle_mode {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-                    state.update();
-                    let _ = state.render(); // pre-paint the hidden surface
-                    state.window.set_visible(true);
-                    // re-assert overlay traits after the hidden start
-                    // (manual monitor cover, never winit fullscreen: that
-                    // breaks DXGI swapchain creation, see dx12_probe)
-                    state.window.set_outer_position(mon_pos);
-                    let _ = state.window.request_inner_size(mon_size);
-                    state.window.set_window_level(WindowLevel::AlwaysOnTop);
-                    state.overlay_visible = true;
-                } else if !wanted && state.overlay_visible {
-                    // any input dismisses the screensaver instantly
-                    state.window.set_visible(false);
-                    state.overlay_visible = false;
+                let wanted = !idle_mode || idle_seconds() >= state.idle_minutes * 60.0;
+                let any_visible = state.panes.iter().any(|p| p.visible);
+                for i in 0..state.panes.len() {
+                    let ready = { state.panes[i].shared.lock().unwrap().width > 0 };
+                    let booted = ready || waited > 3.0;
+                    if booted && !ready && !boot_warned {
+                        boot_warned = true;
+                        eprintln!(
+                            "warning: no capture frame after {waited:.1}s - \
+                             showing test pattern; check 'capture:' messages above"
+                        );
+                    }
+                    let show = wanted && booted;
+                    if show && !state.panes[i].visible {
+                        if idle_mode && !any_visible {
+                            // grow in from nothing when appearing out of idle
+                            state.appear_start = Some(std::time::Instant::now());
+                        }
+                        state.update_pane(i);
+                        let _ = state.render_pane(i); // pre-paint while hidden
+                        let pane = &mut state.panes[i];
+                        pane.window.set_visible(true);
+                        // re-assert overlay traits after the hidden start
+                        pane.window.set_outer_position(pane.mon_pos);
+                        let _ = pane.window.request_inner_size(pane.mon_size);
+                        pane.window.set_window_level(WindowLevel::AlwaysOnTop);
+                        pane.visible = true;
+                    } else if !show && state.panes[i].visible {
+                        // any input dismisses the screensaver instantly
+                        let pane = &mut state.panes[i];
+                        pane.window.set_visible(false);
+                        pane.visible = false;
+                    }
                 }
+
                 // update-check result: surface it as the first menu entry
                 #[cfg(any(windows, target_os = "macos"))]
                 if update_item.is_none() {
@@ -1448,22 +1597,25 @@ fn main() {
                         } else if let Some(idx) =
                             t.positions.iter().position(|it| it.id() == &ev.id)
                         {
-                            state.pinned = if idx == 1 { Some(state.center) } else { None };
+                            state.pinned_px = if idx == 1 {
+                                Some(state.center_px)
+                            } else {
+                                None
+                            };
                             check_one(&t.positions, idx);
                         } else if let Some(idx) =
                             t.monitors.iter().position(|it| it.id() == &ev.id)
                         {
-                            if idx != current_monitor {
-                                if let Some(m) = monitors.get(idx) {
-                                    state.set_monitor(idx, m.position(), m.size());
-                                    current_monitor = idx;
-                                }
+                            let sel = if idx == 0 { None } else { Some(idx - 1) };
+                            if sel != current_sel {
+                                state.set_selection(elwt, &monitors, sel);
+                                current_sel = sel;
                             }
-                            check_one(&t.monitors, current_monitor);
+                            check_one(&t.monitors, idx);
                         }
                     }
                     // placement hotkey pins the hole; mirror that in the menu
-                    let now_pinned = state.pinned.is_some();
+                    let now_pinned = state.pinned_px.is_some();
                     if now_pinned != tray_pinned_ui {
                         tray_pinned_ui = now_pinned;
                         for (j, it) in t.positions.iter().enumerate() {
@@ -1517,36 +1669,31 @@ fn main() {
                                     }
                                     if cfg.pin_x != prev_cfg.pin_x || cfg.pin_y != prev_cfg.pin_y
                                     {
-                                        state.pinned = match (cfg.pin_x, cfg.pin_y) {
-                                            (Some(x), Some(y)) => {
-                                                Some([x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)])
-                                            }
+                                        state.pinned_px = match (cfg.pin_x, cfg.pin_y) {
+                                            (Some(x), Some(y)) => Some([
+                                                state.roam_pos[0]
+                                                    + state.roam_size[0]
+                                                        * x.clamp(0.0, 1.0) as f64,
+                                                state.roam_pos[1]
+                                                    + state.roam_size[1]
+                                                        * y.clamp(0.0, 1.0) as f64,
+                                            ]),
                                             _ => None,
                                         };
                                     }
                                     if cfg.monitor != prev_cfg.monitor {
-                                        if let Some(idx) =
-                                            cfg.monitor.map(|m| m.saturating_sub(1))
-                                        {
-                                            if idx != current_monitor {
-                                                if let Some(m) = monitors.get(idx) {
-                                                    state.set_monitor(
-                                                        idx,
-                                                        m.position(),
-                                                        m.size(),
-                                                    );
-                                                    current_monitor = idx;
-                                                    #[cfg(any(
-                                                        windows,
-                                                        target_os = "macos"
-                                                    ))]
-                                                    if let Some(t) = &tray {
-                                                        for (j, it) in
-                                                            t.monitors.iter().enumerate()
-                                                        {
-                                                            it.set_checked(j == idx);
-                                                        }
-                                                    }
+                                        let sel = sel_from_cfg(cfg.monitor);
+                                        if sel != current_sel {
+                                            state.set_selection(elwt, &monitors, sel);
+                                            current_sel = sel;
+                                            #[cfg(any(windows, target_os = "macos"))]
+                                            if let Some(t) = &tray {
+                                                let checked = match current_sel {
+                                                    None => 0,
+                                                    Some(i) => i + 1,
+                                                };
+                                                for (j, it) in t.monitors.iter().enumerate() {
+                                                    it.set_checked(j == checked);
                                                 }
                                             }
                                         }
@@ -1561,19 +1708,24 @@ fn main() {
                 // frame pacing: hidden -> low-power 0.5s idle polling (no
                 // rendering at all); uncapped -> vsync-bound Poll; capped ->
                 // wake at the next frame deadline (saves battery)
-                if !state.overlay_visible {
+                let visible = state.panes.iter().any(|p| p.visible);
+                if !visible {
                     elwt.set_control_flow(ControlFlow::WaitUntil(
                         std::time::Instant::now() + std::time::Duration::from_millis(500),
                     ));
                 } else if state.fps == 0 {
-                    state.window.request_redraw();
+                    for p in state.panes.iter().filter(|p| p.visible) {
+                        p.window.request_redraw();
+                    }
                     elwt.set_control_flow(ControlFlow::Poll);
                 } else {
                     let now = std::time::Instant::now();
                     if now >= next_frame {
                         next_frame =
                             now + std::time::Duration::from_secs_f64(1.0 / state.fps as f64);
-                        state.window.request_redraw();
+                        for p in state.panes.iter().filter(|p| p.visible) {
+                            p.window.request_redraw();
+                        }
                     }
                     elwt.set_control_flow(ControlFlow::WaitUntil(next_frame));
                 }

@@ -28,8 +28,10 @@ freed from Ghostty and Claude Code.
 - **Place it anywhere** - hold Ctrl+Shift and the hole follows your mouse;
   release to pin it in place. Tray: Position, or `pin_x`/`pin_y` in the
   config file; Auto drift resumes the wandering
-- **Multi-monitor** - pick which monitor the hole lives on from the tray
-  (or `monitor` in the config file); the capture follows along
+- **Multi-monitor** - the hole roams across all monitors by default,
+  crossing boundaries seamlessly (one overlay and capture per monitor).
+  Confine it to a single monitor from the tray or with `monitor` in the
+  config file
 - **Screensaver mode** - optionally appear only after N minutes without
   keyboard/mouse input, swelling out of nothing, and vanish on the first
   input (tray: Screensaver, or `idle_minutes` in the config file)

@@ -98,7 +98,8 @@ impl Output {
 
 /// Start capturing the primary display. ScreenCaptureKit delivers frames on
 /// its own dispatch queue, so this returns immediately.
-pub fn start(shared: Shared) {
+pub fn start(shared: Shared, monitor_index: usize) {
+    shared.lock().unwrap().monitor_index = monitor_index;
     eprintln!("capture: requesting shareable content (screen-recording permission)");
     let handler = RcBlock::new(move |content: *mut SCShareableContent, error: *mut NSError| {
         if content.is_null() {

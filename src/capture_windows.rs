@@ -236,7 +236,7 @@ fn run(
 /// overlay, so a captured copy would ghost near the hole) and no yellow
 /// capture-indicator border. Both toggles are unsupported on some older
 /// Windows 10 builds, so fall back progressively if starting fails.
-pub fn start(shared: Shared) {
+pub fn start(shared: Shared, monitor_index: usize) {
     std::thread::spawn(move || loop {
         let idx = {
             // fresh session: reset frame + GPU-sharing negotiation state
@@ -250,6 +250,10 @@ pub fn start(shared: Shared) {
             g.epoch = g.epoch.wrapping_add(1);
             g.monitor_index
         };
+        let _ = monitor_index; // fixed per pane; shared carries the live value
+        if idx == usize::MAX {
+            return; // pane torn down
+        }
         let attempts: [(CursorCaptureSettings, DrawBorderSettings, &str); 3] = [
             (
                 CursorCaptureSettings::WithoutCursor,
