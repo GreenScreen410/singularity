@@ -97,6 +97,7 @@ struct FileCfg {
     drift_y: Option<f32>,
     fps: Option<u32>,
     idle_minutes: Option<f32>,
+    check_updates: Option<u32>,
 }
 
 fn parse_config(text: &str) -> FileCfg {
@@ -113,6 +114,7 @@ fn parse_config(text: &str) -> FileCfg {
             "drift_y" => cfg.drift_y = v.parse().ok(),
             "fps" => cfg.fps = v.parse().ok(),
             "idle_minutes" => cfg.idle_minutes = v.parse().ok(),
+            "check_updates" => cfg.check_updates = v.parse().ok(),
             _ => {}
         }
     }
@@ -148,6 +150,11 @@ const DEFAULT_CONFIG: &str = "\
 # Screensaver mode: appear only after this many minutes without any
 # keyboard/mouse input, and vanish on the first input. 0 = always visible.
 #idle_minutes = 0
+
+# Once a day, ask GitHub whether a newer release exists and show it in the
+# tray menu. This is the only network access the app ever makes.
+# 0 = never check. Takes effect on restart.
+#check_updates = 1
 ";
 
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -713,6 +720,71 @@ fn exclude_from_capture(window: &Window) {
     }
 }
 
+// ------------------------------ update check -------------------------------
+// Once a day, ask the GitHub API for the latest release tag using the OS's
+// bundled curl (no HTTP dependency in the app). If it is newer, the tray
+// gains an "Update available" entry that opens the releases page. Opt out
+// with check_updates = 0 in the config file.
+
+#[cfg(any(windows, target_os = "macos"))]
+const RELEASES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
+
+#[cfg(any(windows, target_os = "macos"))]
+fn fetch_latest_version() -> Option<String> {
+    const API: &str =
+        "https://api.github.com/repos/GreenScreen410/singularity/releases/latest";
+    let mut cmd = std::process::Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
+    cmd.args(["-s", "--max-time", "10", "-H", "User-Agent: singularity", API]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().ok()?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    // extract "tag_name": "x.y.z" without pulling in a JSON parser
+    let rest = &body[body.find("\"tag_name\"")?..];
+    let after = rest[rest.find(':')? + 1..].trim_start().strip_prefix('"')?;
+    Some(after[..after.find('"')?].trim_start_matches('v').to_string())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn is_newer(latest: &str, current: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
+    let l = parse(latest);
+    !l.is_empty() && l > parse(current)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn start_update_check(found: Arc<Mutex<Option<String>>>) {
+    std::thread::spawn(move || loop {
+        if let Some(latest) = fetch_latest_version() {
+            let current = env!("CARGO_PKG_VERSION");
+            if is_newer(&latest, current) {
+                eprintln!("update: {latest} available (running {current})");
+                *found.lock().unwrap() = Some(latest);
+                return; // one notification per run is enough
+            }
+            eprintln!("update: up to date ({current})");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(24 * 60 * 60));
+    });
+}
+
+#[cfg(windows)]
+fn open_url(url: &str) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .creation_flags(0x0800_0000)
+        .spawn();
+}
+
+#[cfg(target_os = "macos")]
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
+}
+
 /// LUID of the system default adapter: the one D3D11CreateDevice(None) and
 /// therefore the capture uses. (LowPart, HighPart).
 #[cfg(windows)]
@@ -824,6 +896,7 @@ const IDLE_OPTS: [(&str, f32); 4] =
 #[cfg(any(windows, target_os = "macos"))]
 struct Tray {
     _icon: tray_icon::TrayIcon,
+    menu: tray_icon::menu::Menu,
     presets: Vec<tray_icon::menu::CheckMenuItem>,
     sizes: Vec<tray_icon::menu::CheckMenuItem>,
     speeds: Vec<tray_icon::menu::CheckMenuItem>,
@@ -879,13 +952,14 @@ fn build_tray() -> Tray {
     menu.append(&quit).unwrap();
     let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32).unwrap();
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .with_tooltip("Singularity - right-click to change look and options")
         .with_icon(icon)
         .build()
         .unwrap();
     Tray {
         _icon: tray,
+        menu,
         presets,
         sizes,
         speeds,
@@ -915,6 +989,23 @@ fn main() {
     let mut last_cfg_check = std::time::Instant::now();
     let mut next_frame = std::time::Instant::now();
     let mut boot_warned = false;
+
+    // daily update check (config: check_updates = 0 opts out, read at startup)
+    #[cfg(any(windows, target_os = "macos"))]
+    let update_available: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let enabled = cfg_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| parse_config(&t).check_updates.unwrap_or(1) != 0)
+            .unwrap_or(true);
+        if enabled {
+            start_update_check(update_available.clone());
+        }
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    let mut update_item: Option<tray_icon::menu::MenuItem> = None;
 
     let event_loop = EventLoop::new().unwrap();
     // Manual borderless "fullscreen": an undecorated window sized and placed
@@ -1034,10 +1125,34 @@ fn main() {
                     state.window.set_visible(false);
                     state.overlay_visible = false;
                 }
+                // update-check result: surface it as the first menu entry
+                #[cfg(any(windows, target_os = "macos"))]
+                if update_item.is_none() {
+                    if let (Some(t), Some(ver)) =
+                        (&tray, update_available.lock().unwrap().clone())
+                    {
+                        let item = tray_icon::menu::MenuItem::new(
+                            format!("Update available: {ver}"),
+                            true,
+                            None,
+                        );
+                        let _ = t.menu.insert(&item, 0);
+                        let _ = t
+                            .menu
+                            .insert(&tray_icon::menu::PredefinedMenuItem::separator(), 1);
+                        update_item = Some(item);
+                    }
+                }
                 // tray menu events arrive on a global channel; poll each tick
                 #[cfg(any(windows, target_os = "macos"))]
                 if let Some(t) = &tray {
                     while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+                        if let Some(ui) = &update_item {
+                            if &ev.id == ui.id() {
+                                open_url(RELEASES_URL);
+                                continue;
+                            }
+                        }
                         let check_one = |items: &[tray_icon::menu::CheckMenuItem], idx: usize| {
                             for (j, it) in items.iter().enumerate() {
                                 it.set_checked(j == idx);

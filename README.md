@@ -28,6 +28,10 @@ freed from Ghostty and Claude Code.
 - **Screensaver mode** - optionally appear only after N minutes without
   keyboard/mouse input, swelling out of nothing, and vanish on the first
   input (tray: Screensaver, or `idle_minutes` in the config file)
+- **Update notice** - once a day the app asks GitHub whether a newer
+  release exists and, if so, adds an "Update available" entry to the tray
+  menu that opens the releases page. That is the only network access it
+  ever makes; set `check_updates = 0` in the config file to disable it
 - **Single self-contained exe** - no runtime, no installer, ~8 MB
 
 ## Build & run
