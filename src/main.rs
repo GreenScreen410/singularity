@@ -1356,7 +1356,7 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
     let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32).unwrap();
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu.clone()))
-        .with_tooltip("Singularity - right-click to change look and options")
+        .with_tooltip(concat!("Singularity ", env!("CARGO_PKG_VERSION"), " - right-click for options"))
         .with_icon(icon)
         .build()
         .unwrap();
@@ -1379,22 +1379,47 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
 fn main() {
     env_logger::init();
 
-    // Single instance: a second copy would double every overlay and stamp
-    // the screenshot fix twice. The named mutex lives until the process dies.
+    // Single instance with takeover: a second copy would double every
+    // overlay, so instead of just refusing to start, a relaunch asks the
+    // running instance to quit (named event) and takes its place. That
+    // makes "run the new exe" the natural way to apply an update.
     #[cfg(windows)]
-    {
+    let quit_event: isize = {
         use windows::core::w;
-        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-        use windows::Win32::System::Threading::CreateMutexW;
-        let handle = unsafe { CreateMutexW(None, false, w!("Local\\SingularityOverlay")) };
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            eprintln!("singularity is already running; exiting");
+        use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, ResetEvent, SetEvent};
+        let ev = unsafe { CreateEventW(None, true, false, w!("Local\\SingularityQuit")) }
+            .expect("event");
+        let mut owned = false;
+        for attempt in 0..28 {
+            let h = unsafe { CreateMutexW(None, false, w!("Local\\SingularityOverlay")) };
+            if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                if let Ok(h) = h {
+                    std::mem::forget(h); // held for the lifetime of the process
+                }
+                owned = true;
+                break;
+            }
+            if let Ok(h) = h {
+                let _ = unsafe { CloseHandle(h) };
+            }
+            if attempt == 0 {
+                eprintln!("another instance is running; asking it to hand over");
+                let _ = unsafe { SetEvent(ev) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        if !owned {
+            eprintln!(
+                "the running instance did not quit (an older version?); \
+                 close it from the tray and launch again"
+            );
             return;
         }
-        if let Ok(h) = handle {
-            std::mem::forget(h); // held for the lifetime of the process
-        }
-    }
+        // we own the overlay now; clear any stale handover request
+        let _ = unsafe { ResetEvent(ev) };
+        ev.0 as isize
+    };
 
     // config-file state; read once now for startup-only decisions
     let cfg_path = config_path();
@@ -1565,6 +1590,20 @@ fn main() {
                 }
             }
             Event::AboutToWait => {
+                // a newer launch asked us to hand over the overlay
+                #[cfg(windows)]
+                {
+                    use windows::Win32::Foundation::HANDLE;
+                    use windows::Win32::System::Threading::WaitForSingleObject;
+                    if unsafe {
+                        WaitForSingleObject(HANDLE(quit_event as *mut _), 0)
+                    }
+                    .0 == 0
+                    {
+                        eprintln!("handover requested by a newer launch; exiting");
+                        elwt.exit();
+                    }
+                }
                 state.tick_center();
 
                 // Visibility state machine, per pane. This must live HERE,
