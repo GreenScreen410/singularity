@@ -184,8 +184,10 @@ const DEFAULT_CONFIG: &str = "\
 #monitor = 0
 
 # Black hole spin (Kerr metric): 0 = static, up to 0.98. A spinning hole
-# drags spacetime around with it: the shadow deforms toward a D shape and
-# the lensing twists asymmetrically. Costs more GPU while nonzero.
+# drags spacetime around with it: the shadow shifts against the lensing
+# and the background swirls around the hole (exact geometry plus a
+# dramatized swirl, since the true twist is too subtle to see). Costs
+# more GPU while nonzero.
 #spin = 0
 
 # Print Screen produces a hole-less image (the overlay must exclude itself

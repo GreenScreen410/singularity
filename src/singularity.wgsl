@@ -204,6 +204,27 @@ fn shade_crossing(
 // Christoffel symbols while integrating the exact metric.
 const KERR_STEPS: i32 = 88;
 
+// Prograde ISCO radius in r_s units (Bardeen 1972). spin = a/M in [0,1).
+// At spin 0 this is 3 r_s (= 6M), shrinking toward ~0.6 r_s as spin -> 1:
+// a fast-spinning hole lets the disk hug the shadow, which is the most
+// visible consequence of spin.
+// Dramatized frame-drag swirl. The exact azimuthal twist of Kerr lensing
+// is physically real but imperceptible at desktop scale, so the VISIBLE
+// layer exaggerates it: background samples rotate around the hole, strongest
+// near the ring, prograde with the disk. Zero spin is an exact no-op.
+fn drag_twist(b_rs: f32, spin_signed: f32) -> f32 {
+    return 1.3 * spin_signed / (1.0 + 0.8 * pow(b_rs / B_CRIT, 2.0));
+}
+
+fn kerr_isco_rs(spin: f32) -> f32 {
+    let a = clamp(spin, 0.0, 0.999);
+    let z1 = 1.0 + pow(1.0 - a * a, 1.0 / 3.0)
+           * (pow(1.0 + a, 1.0 / 3.0) + pow(1.0 - a, 1.0 / 3.0));
+    let z2 = sqrt(3.0 * a * a + z1 * z1);
+    let r_m = 3.0 + z2 - sqrt((3.0 - z1) * (3.0 + z1 + 2.0 * z2));
+    return r_m * 0.5; // M units -> r_s units (r_s = 2M)
+}
+
 fn ks_r(pos: vec3<f32>, a: f32) -> f32 {
     let rho2 = dot(pos, pos);
     let bq = rho2 - a * a;
@@ -289,9 +310,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let dir = p / max(plen, 1e-5);
         // mild chromatic aberration: blue bends a touch more than red
         let ab = 0.035 * smoothstep(1.0, 2.0, b / bmax);
-        let sp_r = p - dir * defl * (1.0 - ab);
-        let sp_g = p - dir * defl;
-        let sp_b = p - dir * defl * (1.0 + ab);
+        let sdir_far = select(1.0, -1.0, u.speed < 0.0);
+        let tw = drag_twist(b, u.spin * sdir_far);
+        let sp_r = rot(p - dir * defl * (1.0 - ab), tw);
+        let sp_g = rot(p - dir * defl, tw);
+        let sp_b = rot(p - dir * defl * (1.0 + ab), tw);
         let col = vec3<f32>(
             background(center + sp_r / vec2<f32>(aspect, 1.0)).r,
             background(center + sp_g / vec2<f32>(aspect, 1.0)).g,
@@ -360,6 +383,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // disk normal): rows of the world->BH rotation are (x_hat, e2, n).
         let a = 0.5 * u.spin * sdir;     // a = M spin, prograde with the disk
         let rhor = 0.5 + sqrt(max(0.25 - a * a, 0.0)); // event horizon radius
+        // spin shrinks the ISCO, so the disk reaches much closer to the
+        // hole: scale the preset inner edge by the ISCO ratio (ISCO = 3 r_s
+        // at zero spin) and keep it just outside the horizon
+        let rin_k = max(rin * kerr_isco_rs(u.spin) / 3.0, kerr_isco_rs(u.spin));
         var xb = vec3<f32>(x.x, dot(x, e2), dot(x, n));
         var pb = vec3<f32>(v.x, dot(v, e2), dot(v, n));
         var sPrev = xb.z;
@@ -408,7 +435,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             let tpl = (-LENS_DEPTH - x.z) / d.z;
             let hp  = x + d * tpl;
             let q   = rot(hp.xy, -u.roll) / W;
-            let sp  = vec2<f32>(q.x, -q.y);
+            var sp  = vec2<f32>(q.x, -q.y);
+            sp = rot(sp, drag_twist(b, u.spin * sdir));
             // fade the *displacement*, never the color - no seam anywhere
             let suv = center + (p + (sp - p) * window) / vec2<f32>(aspect, 1.0);
             // rays bent past ~90° never reach the sky plane; fade them out

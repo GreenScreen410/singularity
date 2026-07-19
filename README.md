@@ -35,8 +35,11 @@ freed from Ghostty and Claude Code.
 - **Kerr mode** - give the hole spin (tray: Spin, config: `spin` up to
   0.98) and it integrates exact Kerr geodesics in Kerr-Schild
   coordinates instead of Schwarzschild: frame dragging displaces the
-  shadow against the lensing and twists the whole field asymmetrically.
-  Costs more GPU while nonzero
+  shadow against the lensing, the ISCO shrinks so the disk hugs the
+  hole, and the field twists asymmetrically. On top of the exact
+  geometry sits a deliberately dramatized swirl layer, because the
+  true twist is physically real but too subtle to read at desktop
+  scale. Costs more GPU while nonzero
 - **Screensaver mode** - optionally appear only after N minutes without
   keyboard/mouse input, swelling out of nothing, and vanish on the first
   input (tray: Screensaver, or `idle_minutes` in the config file)
