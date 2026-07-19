@@ -1360,6 +1360,23 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
 fn main() {
     env_logger::init();
 
+    // Single instance: a second copy would double every overlay and stamp
+    // the screenshot fix twice. The named mutex lives until the process dies.
+    #[cfg(windows)]
+    {
+        use windows::core::w;
+        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::CreateMutexW;
+        let handle = unsafe { CreateMutexW(None, false, w!("Local\\SingularityOverlay")) };
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            eprintln!("singularity is already running; exiting");
+            return;
+        }
+        if let Ok(h) = handle {
+            std::mem::forget(h); // held for the lifetime of the process
+        }
+    }
+
     // config-file state; read once now for startup-only decisions
     let cfg_path = config_path();
     let startup_cfg = cfg_path
@@ -1589,9 +1606,6 @@ fn main() {
                         last_clip_seq = seq;
                         let recent =
                             last_prtscn.is_some_and(|t| t.elapsed().as_secs_f32() < 10.0);
-                        eprintln!(
-                            "screenshot: clipboard changed (prtscn recent: {recent})"
-                        );
                         if fix_screenshots && recent && state.panes.iter().any(|p| p.visible) {
                             let shots: Vec<screenshot_fix::PaneShot> = state
                                 .panes
@@ -1604,6 +1618,14 @@ fn main() {
                                     uniforms: state.pane_uniforms(i),
                                 })
                                 .collect();
+                            for sh in &shots {
+                                eprintln!(
+                                    "screenshot: pane at ({},{}) {}x{} center=({:.3},{:.3}) r={:.3}",
+                                    sh.pos.0, sh.pos.1, sh.size.0, sh.size.1,
+                                    sh.uniforms.center[0], sh.uniforms.center[1],
+                                    sh.uniforms.hole_radius
+                                );
+                            }
                             match screenshot_fix::try_fix(
                                 &state.device,
                                 &state.queue,
