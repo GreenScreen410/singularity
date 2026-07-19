@@ -65,7 +65,8 @@ pub struct Uniforms {
     pub look: [f32; 14], // temp incl roll inner outer opac dopp beam gain contr wind speed expo star
     pub hole_radius: f32,
     pub center: [f32; 2], // hole centre in uv, computed on the CPU
-    pub _pad: [f32; 3],
+    pub spin: f32,        // Kerr spin 0..0.99; 0 = Schwarzschild fast path
+    pub _pad: [f32; 2],
 }
 
 const DEFAULT_SIZE: f32 = 0.09; // shadow radius, fraction of screen height
@@ -108,6 +109,7 @@ struct FileCfg {
     pin_y: Option<f32>,
     monitor: Option<usize>, // 0 = all, otherwise 1-based
     fix_screenshots: Option<u32>,
+    spin: Option<f32>,
 }
 
 fn parse_config(text: &str) -> FileCfg {
@@ -129,6 +131,7 @@ fn parse_config(text: &str) -> FileCfg {
             "pin_y" => cfg.pin_y = v.parse().ok(),
             "monitor" => cfg.monitor = v.parse().ok(),
             "fix_screenshots" => cfg.fix_screenshots = v.parse().ok(),
+            "spin" => cfg.spin = v.parse().ok(),
             _ => {}
         }
     }
@@ -179,6 +182,11 @@ const DEFAULT_CONFIG: &str = "\
 # Monitors: 0 = roam across all of them (default), N = stay on monitor N.
 # Also in the tray menu.
 #monitor = 0
+
+# Black hole spin (Kerr metric): 0 = static, up to 0.98. A spinning hole
+# drags spacetime around with it: the shadow deforms toward a D shape and
+# the lensing twists asymmetrically. Costs more GPU while nonzero.
+#spin = 0
 
 # Print Screen produces a hole-less image (the overlay must exclude itself
 # from capture, or it would capture itself forever). When this is on, a
@@ -247,6 +255,7 @@ struct State {
     drift_x: f32,
     drift_y: f32,
     fps: u32,          // 0 = uncapped (vsync only)
+    spin: f32,         // Kerr spin 0..0.99
     idle_minutes: f32, // 0 = always visible; >0 = appear after this much idle
     appear_start: Option<std::time::Instant>, // grow-in animation anchor
     // hole placement in virtual-desktop pixels: the roam box is the bounding
@@ -436,6 +445,7 @@ impl State {
             drift_x: DEFAULT_DRIFT_X,
             drift_y: DEFAULT_DRIFT_Y,
             fps: 0,
+            spin: 0.0,
             idle_minutes: 0.0,
             appear_start: None,
             roam_pos: [0.0, 0.0],
@@ -806,7 +816,8 @@ impl State {
                 ((self.center_px[1] - pane.mon_pos.y as f64)
                     / pane.mon_size.height.max(1) as f64) as f32,
             ],
-            _pad: [0.0; 3],
+            spin: self.spin,
+            _pad: [0.0; 2],
         }
     }
 
@@ -1264,6 +1275,9 @@ const FPS_OPTS: [(&str, u32); 3] = [("30", 30), ("60", 60), ("Unlimited", 0)];
 #[cfg(any(windows, target_os = "macos"))]
 const IDLE_OPTS: [(&str, f32); 4] =
     [("Off", 0.0), ("1 min", 1.0), ("5 min", 5.0), ("10 min", 10.0)];
+#[cfg(any(windows, target_os = "macos"))]
+const SPIN_OPTS: [(&str, f32); 4] =
+    [("Off", 0.0), ("Medium", 0.6), ("High", 0.9), ("Extreme", 0.98)];
 
 #[cfg(any(windows, target_os = "macos"))]
 struct Tray {
@@ -1274,6 +1288,7 @@ struct Tray {
     speeds: Vec<tray_icon::menu::CheckMenuItem>,
     fps: Vec<tray_icon::menu::CheckMenuItem>,
     idles: Vec<tray_icon::menu::CheckMenuItem>,
+    spins: Vec<tray_icon::menu::CheckMenuItem>,
     positions: Vec<tray_icon::menu::CheckMenuItem>,
     monitors: Vec<tray_icon::menu::CheckMenuItem>,
     open_cfg_id: tray_icon::menu::MenuId,
@@ -1319,6 +1334,7 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
     let speeds = sub("Speed", &SPEEDS.map(|s| s.0), 1);
     let fps = sub("FPS", &FPS_OPTS.map(|s| s.0), 2);
     let idles = sub("Screensaver", &IDLE_OPTS.map(|s| s.0), 0);
+    let spins = sub("Spin", &SPIN_OPTS.map(|s| s.0), 0);
     let positions = sub(
         "Position",
         &["Auto drift", "Pinned (Ctrl+Shift to place)"],
@@ -1350,6 +1366,7 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
         speeds,
         fps,
         idles,
+        spins,
         positions,
         monitors,
         open_cfg_id: open_cfg.id().clone(),
@@ -1447,6 +1464,9 @@ fn main() {
     }
     if let Some(v) = startup_cfg.idle_minutes {
         state.idle_minutes = v;
+    }
+    if let Some(v) = startup_cfg.spin {
+        state.spin = v.clamp(0.0, 0.98);
     }
     if let (Some(x), Some(y)) = (startup_cfg.pin_x, startup_cfg.pin_y) {
         // pin coordinates are fractions of the roam box
@@ -1720,6 +1740,10 @@ fn main() {
                         {
                             state.idle_minutes = IDLE_OPTS[idx].1;
                             check_one(&t.idles, idx);
+                        } else if let Some(idx) = t.spins.iter().position(|it| it.id() == &ev.id)
+                        {
+                            state.spin = SPIN_OPTS[idx].1;
+                            check_one(&t.spins, idx);
                         } else if let Some(idx) =
                             t.positions.iter().position(|it| it.id() == &ev.id)
                         {
@@ -1792,6 +1816,10 @@ fn main() {
                                     }
                                     if cfg.idle_minutes != prev_cfg.idle_minutes {
                                         state.idle_minutes = cfg.idle_minutes.unwrap_or(0.0);
+                                    }
+                                    if cfg.spin != prev_cfg.spin {
+                                        state.spin =
+                                            cfg.spin.unwrap_or(0.0).clamp(0.0, 0.98);
                                     }
                                     if cfg.pin_x != prev_cfg.pin_x || cfg.pin_y != prev_cfg.pin_y
                                     {

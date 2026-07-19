@@ -11,13 +11,18 @@ struct Uniforms {
     look: [f32; 14],
     hole_radius: f32,
     center: [f32; 2],
-    _pad: [f32; 3],
+    spin: f32,
+    _pad: [f32; 2],
 }
 
 const GARGANTUA: [f32; 14] =
     [4500.0, 1.52, 0.10, 2.2, 7.0, 0.85, 0.35, 2.0, 1.4, 0.5, 7.0, 5.0, 1.20, 0.0];
 
 fn main() {
+    let spin: f32 = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0.0);
     let (w, h) = (960u32, 540u32);
     pollster::block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -138,6 +143,7 @@ fn main() {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+            cache: None,
         });
 
         let u = Uniforms {
@@ -147,7 +153,8 @@ fn main() {
             look: GARGANTUA,
             hole_radius: 0.09,
             center: [0.62, 0.45],
-            _pad: [0.0; 3],
+            spin,
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&u));
 

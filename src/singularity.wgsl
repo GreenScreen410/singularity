@@ -17,6 +17,8 @@
 //
 // The terminal-specific modes (token/pomodoro/cursor decode) are replaced by
 // a slow self-drift; the desktop capture plays the role of the lensed sky.
+// A Kerr (spinning) mode integrates the exact rotating metric instead, see
+// the Kerr section below.
 
 // The disk "look" rides in the uniform buffer so the tray menu can switch
 // presets live (values crossfaded on the CPU side).
@@ -41,7 +43,7 @@ struct Uniforms {
     hole_radius: f32,   // shadow radius, fraction of screen height
     center_x: f32,      // hole centre in uv, computed on the CPU
     center_y: f32,      // (drift, pinned or follow-the-cursor placement)
-    _pad0: f32,
+    spin: f32,          // Kerr spin 0..0.99; 0 = Schwarzschild fast path
     _pad1: f32,
     _pad2: f32,
 };
@@ -153,6 +155,99 @@ fn background(uvin: vec2<f32>) -> vec3<f32> {
     return mix(checker, grad, 0.35);
 }
 
+// Shade one thin-disk crossing. xc/vdir in world space; returns the
+// transmittance-weighted emission in rgb and the local density in a.
+fn shade_crossing(
+    xc: vec3<f32>, vdir: vec3<f32>, n: vec3<f32>, e2: vec3<f32>,
+    rin: f32, rout: f32, t: f32, sdir: f32, spd: f32, trans: f32,
+) -> vec4<f32> {
+    let rc = length(xc);
+    if (rc <= rin || rc >= rout) {
+        return vec4<f32>(0.0);
+    }
+    let band = smoothstep(rin, rin * 1.25, rc)
+             * (1.0 - smoothstep(rout * 0.70, rout, rc));
+
+    // disk-plane polar coords for the streak texture
+    let phi   = atan2(dot(xc, e2), xc.x);
+    let turns = phi / 6.2831853;
+    let kep   = pow(rin / rc, 1.5);
+    // sqrt(1 - 1.5/r): time runs slower for the inner orbits
+    let gloc  = sqrt(max(1.0 - 1.5 / rc, 0.02));
+    let swirl = rc * u.wind * 0.12 - t * kep * spd * gloc * sdir;
+    var streaks = vnoiseWrapY(vec2<f32>(rc * 2.8, turns * 19.0 + swirl * 3.0), 19.0) * 0.65
+                + vnoiseWrapY(vec2<f32>(rc * 1.0, turns * 9.0  + swirl * 1.5 + 7.0), 9.0) * 0.35;
+    streaks = 0.35 + u.contr * streaks * streaks;
+
+    // relativistic Doppler + gravitational shift for circular-orbit gas
+    let gasdir = normalize(cross(n, xc)) * sdir;
+    let beta   = clamp(inverseSqrt(max(2.0 * (rc - 1.0), 0.2)), 0.0, 0.99);
+    var g = gloc / max(1.0 + beta * dot(gasdir, vdir), 0.05);
+    g = mix(1.0, g, u.dopp);
+
+    // Shakura-Sunyaev temperature profile, peak normalized to 1
+    let xpr   = max(1.0 - sqrt(rin / rc), 0.0);
+    let tprof = pow(rin / rc, 0.75) * pow(xpr, 0.25) / 0.488;
+    let cbb   = blackbody(u.temp * tprof * g);
+    let boost = pow(g, u.beam);
+
+    let density = band * streaks;
+    return vec4<f32>(trans * cbb * (u.gain * 2.2 * density * tprof * tprof * boost), density);
+}
+
+// -------------------------- Kerr (spinning) mode ---------------------------
+// Exact Kerr null geodesics via the Hamiltonian in Kerr-Schild coordinates:
+// H = 1/2 (|p|^2 - E^2) - 1/2 f (l.p + E)^2, with f = 2 M r^3/(r^4 + a^2 z^2).
+// M = 0.5 so r_s = 2M = 1 keeps every existing unit; the user-facing spin
+// 0..1 maps to a = 0.5 spin (extremal at a = M). dx/dlambda is analytic and
+// dp/dlambda comes from central differences of H, which avoids hand-deriving
+// Christoffel symbols while integrating the exact metric.
+const KERR_STEPS: i32 = 88;
+
+fn ks_r(pos: vec3<f32>, a: f32) -> f32 {
+    let rho2 = dot(pos, pos);
+    let bq = rho2 - a * a;
+    let r2 = 0.5 * (bq + sqrt(bq * bq + 4.0 * a * a * pos.z * pos.z));
+    return sqrt(max(r2, 1e-8));
+}
+
+fn kerr_h(pos: vec3<f32>, pm: vec3<f32>, a: f32) -> f32 {
+    let r = ks_r(pos, a);
+    let r2 = r * r;
+    let den = r2 + a * a;
+    let l = vec3<f32>(
+        (r * pos.x + a * pos.y) / den,
+        (r * pos.y - a * pos.x) / den,
+        pos.z / max(r, 1e-6),
+    );
+    let f = r2 * r / (r2 * r2 + a * a * pos.z * pos.z); // 2 M r^3 / (...), M = 0.5
+    let lp = dot(l, pm) + 1.0; // l^mu p_mu with E = 1 (outgoing KS; exact Kerr outside the horizon)
+    return 0.5 * (dot(pm, pm) - 1.0) - 0.5 * f * lp * lp;
+}
+
+fn kerr_dxdl(pos: vec3<f32>, pm: vec3<f32>, a: f32) -> vec3<f32> {
+    let r = ks_r(pos, a);
+    let r2 = r * r;
+    let den = r2 + a * a;
+    let l = vec3<f32>(
+        (r * pos.x + a * pos.y) / den,
+        (r * pos.y - a * pos.x) / den,
+        pos.z / max(r, 1e-6),
+    );
+    let f = r2 * r / (r2 * r2 + a * a * pos.z * pos.z);
+    let lp = dot(l, pm) + 1.0; // matches kerr_h
+    return pm - f * lp * l;
+}
+
+fn kerr_dpdl(pos: vec3<f32>, pm: vec3<f32>, a: f32) -> vec3<f32> {
+    let e = 2e-3;
+    return vec3<f32>(
+        kerr_h(pos - vec3<f32>(e, 0.0, 0.0), pm, a) - kerr_h(pos + vec3<f32>(e, 0.0, 0.0), pm, a),
+        kerr_h(pos - vec3<f32>(0.0, e, 0.0), pm, a) - kerr_h(pos + vec3<f32>(0.0, e, 0.0), pm, a),
+        kerr_h(pos - vec3<f32>(0.0, 0.0, e), pm, a) - kerr_h(pos + vec3<f32>(0.0, 0.0, e), pm, a),
+    ) / (2.0 * e);
+}
+
 // ---------------------------------------------------------------------- main --
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
@@ -223,70 +318,85 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     var emitc = vec3<f32>(0.0);          // accumulated disk light (HDR)
     var trans = 1.0;                     // transmittance toward the background
     var captured = false;
-    var sPrev = dot(x, n);
-    var xPrev = x;
 
-    for (var i: i32 = 0; i < N_STEPS; i = i + 1) {
-        var r2 = dot(x, x);
-        if (r2 < 1.0) { captured = true; break; }         // through the horizon
-        if (x.z < -Z0 && v.z < 0.0) { break; }            // escaped out the back
-        if (r2 > 4.0 * Z0 * Z0) { break; }                // flung far sideways
-        var r = sqrt(r2);
-        // step scales with radius: fine near the photon sphere, coarse far out
-        let dt = clamp(0.16 * r, 0.03, 1.5);
-        // leapfrog (kick-drift-kick) keeps near-critical orbits stable
-        var a = -1.5 * h2 * x / (r2 * r2 * r);
-        v = v + a * (0.5 * dt);
-        x = x + v * dt;
-        r2 = dot(x, x);
-        r  = sqrt(r2);
-        a  = -1.5 * h2 * x / (r2 * r2 * r);
-        v = v + a * (0.5 * dt);
+    if (u.spin < 0.005) {
+        // -------- Schwarzschild fast path (non-spinning) --------
+        var sPrev = dot(x, n);
+        var xPrev = x;
+        for (var i: i32 = 0; i < N_STEPS; i = i + 1) {
+            var r2 = dot(x, x);
+            if (r2 < 1.0) { captured = true; break; }     // through the horizon
+            if (x.z < -Z0 && v.z < 0.0) { break; }        // escaped out the back
+            if (r2 > 4.0 * Z0 * Z0) { break; }            // flung far sideways
+            var r = sqrt(r2);
+            // step scales with radius: fine near the photon sphere
+            let dt = clamp(0.16 * r, 0.03, 1.5);
+            // leapfrog (kick-drift-kick) keeps near-critical orbits stable
+            var acc = -1.5 * h2 * x / (r2 * r2 * r);
+            v = v + acc * (0.5 * dt);
+            x = x + v * dt;
+            r2 = dot(x, x);
+            r  = sqrt(r2);
+            acc = -1.5 * h2 * x / (r2 * r2 * r);
+            v = v + acc * (0.5 * dt);
 
-        // ---- thin-disk crossing: the ray pierced the disk plane ----
-        let s = dot(x, n);
-        if (s * sPrev < 0.0 && trans > 0.02) {
-            let tc = sPrev / (sPrev - s);
-            let xc = mix(xPrev, x, tc);
-            let rc = length(xc);
-            if (rc > rin && rc < rout) {
-                let band = smoothstep(rin, rin * 1.25, rc)
-                         * (1.0 - smoothstep(rout * 0.70, rout, rc));
-
-                // disk-plane polar coords for the streak texture
-                let phi   = atan2(dot(xc, e2), xc.x);
-                let turns = phi / 6.2831853;
-                let kep   = pow(rin / rc, 1.5);
-                // √(1 − 1.5/r): time runs slower for the inner orbits
-                let gloc  = sqrt(max(1.0 - 1.5 / rc, 0.02));
-                let swirl = rc * u.wind * 0.12 - t * kep * spd * gloc * sdir;
-                var streaks = vnoiseWrapY(vec2<f32>(rc * 2.8, turns * 19.0 + swirl * 3.0), 19.0) * 0.65
-                            + vnoiseWrapY(vec2<f32>(rc * 1.0, turns * 9.0  + swirl * 1.5 + 7.0), 9.0) * 0.35;
-                streaks = 0.35 + u.contr * streaks * streaks;
-
-                // relativistic Doppler + gravitational shift for circular-orbit
-                // gas: g = √(1 − 1.5/r) / (1 − β·k̂)
-                let gasdir = normalize(cross(n, xc)) * sdir;
-                let beta   = clamp(inverseSqrt(max(2.0 * (rc - 1.0), 0.2)), 0.0, 0.99);
-                var g = gloc / max(1.0 + beta * dot(gasdir, normalize(v)), 0.05);
-                g = mix(1.0, g, u.dopp);
-
-                // Shakura-Sunyaev temperature profile, peak normalized to 1
-                let xpr   = max(1.0 - sqrt(rin / rc), 0.0);
-                let tprof = pow(rin / rc, 0.75) * pow(xpr, 0.25) / 0.488;
-                let cbb   = blackbody(u.temp * tprof * g);      // shifted color
-                let boost = pow(g, u.beam);                     // beaming
-
-                let density = band * streaks;
-                emitc = emitc + trans * cbb * (u.gain * 2.2 * density * tprof * tprof * boost);
-                trans = trans * (1.0 - clamp(u.opac * density, 0.0, 1.0));
+            // thin-disk crossing
+            let s = dot(x, n);
+            if (s * sPrev < 0.0 && trans > 0.02) {
+                let tc = sPrev / (sPrev - s);
+                let xc = mix(xPrev, x, tc);
+                let sh = shade_crossing(xc, normalize(v), n, e2, rin, rout, t, sdir, spd, trans);
+                emitc = emitc + sh.rgb;
+                trans = trans * (1.0 - clamp(u.opac * sh.a, 0.0, 1.0));
             }
+            sPrev = s;
+            xPrev = x;
         }
-        sPrev = s;
-        xPrev = x;
+        // rays still winding when the budget ran out are as good as captured
+        if (!captured && dot(x, x) < 4.0) { captured = true; }
+    } else {
+        // -------- Kerr path: exact spinning-hole geodesics --------
+        // Integrate in the black hole frame where the spin axis is +z (the
+        // disk normal): rows of the world->BH rotation are (x_hat, e2, n).
+        let a = 0.5 * u.spin * sdir;     // a = M spin, prograde with the disk
+        let rhor = 0.5 + sqrt(max(0.25 - a * a, 0.0)); // event horizon radius
+        var xb = vec3<f32>(x.x, dot(x, e2), dot(x, n));
+        var pb = vec3<f32>(v.x, dot(v, e2), dot(v, n));
+        var sPrev = xb.z;
+        var xPrev = xb;
+        for (var i: i32 = 0; i < KERR_STEPS; i = i + 1) {
+            let r = ks_r(xb, a);
+            if (r < rhor + 0.02) { captured = true; break; }
+            if (r > 1.4 * Z0 && dot(xb, kerr_dxdl(xb, pb, a)) > 0.0) { break; }
+            // leapfrog in Hamiltonian form; dp from central differences of H
+            let dl = clamp(0.16 * r, 0.02, 1.1);
+            pb = pb + kerr_dpdl(xb, pb, a) * (0.5 * dl);
+            xb = xb + kerr_dxdl(xb, pb, a) * dl;
+            pb = pb + kerr_dpdl(xb, pb, a) * (0.5 * dl);
+
+            // thin-disk crossing at the BH equator (z = 0 in this frame)
+            if (xb.z * sPrev < 0.0 && trans > 0.02) {
+                let tc = sPrev / (sPrev - xb.z);
+                let xcb = mix(xPrev, xb, tc);
+                // back to world space for the shared disk shading
+                let xc = xcb.x * vec3<f32>(1.0, 0.0, 0.0) + xcb.y * e2 + xcb.z * n;
+                let vb = kerr_dxdl(xb, pb, a);
+                let vw = vb.x * vec3<f32>(1.0, 0.0, 0.0) + vb.y * e2 + vb.z * n;
+                let sh = shade_crossing(xc, normalize(vw), n, e2, rin, rout, t, sdir, spd, trans);
+                emitc = emitc + sh.rgb;
+                trans = trans * (1.0 - clamp(u.opac * sh.a, 0.0, 1.0));
+            }
+            sPrev = xb.z;
+            xPrev = xb;
+        }
+        // budget exhausted while still winding near the photon orbits
+        // (Kerr retrograde photon orbit reaches r = 4M = 2.0; add margin)
+        if (!captured && ks_r(xb, a) < 2.4) { captured = true; }
+        // back to world space for the shared background projection
+        let vb = kerr_dxdl(xb, pb, a);
+        x = xb.x * vec3<f32>(1.0, 0.0, 0.0) + xb.y * e2 + xb.z * n;
+        v = vb.x * vec3<f32>(1.0, 0.0, 0.0) + vb.y * e2 + vb.z * n;
     }
-    // rays still wound up near the photon sphere when the budget ran out
-    if (!captured && dot(x, x) < 4.0) { captured = true; }
 
     // ---- background: where did the escaped ray come from? ----
     var bg = vec3<f32>(0.0);

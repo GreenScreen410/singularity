@@ -32,6 +32,11 @@ freed from Ghostty and Claude Code.
   crossing boundaries seamlessly (one overlay and capture per monitor).
   Confine it to a single monitor from the tray or with `monitor` in the
   config file
+- **Kerr mode** - give the hole spin (tray: Spin, config: `spin` up to
+  0.98) and it integrates exact Kerr geodesics in Kerr-Schild
+  coordinates instead of Schwarzschild: frame dragging displaces the
+  shadow against the lensing and twists the whole field asymmetrically.
+  Costs more GPU while nonzero
 - **Screensaver mode** - optionally appear only after N minutes without
   keyboard/mouse input, swelling out of nothing, and vanish on the first
   input (tray: Screensaver, or `idle_minutes` in the config file)
