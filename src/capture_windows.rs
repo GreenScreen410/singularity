@@ -73,6 +73,7 @@ struct Handler {
     got_first: bool,
     gpu: Option<GpuPath>,
     gpu_failed: bool,
+    monitor_index: usize, // which monitor this session captures
 }
 
 impl Handler {
@@ -85,24 +86,31 @@ impl Handler {
 }
 
 impl GraphicsCaptureApiHandler for Handler {
-    type Flags = Shared;
+    type Flags = (Shared, usize);
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
-            shared: ctx.flags,
+            shared: ctx.flags.0,
             scratch: Vec::new(),
             got_first: false,
             gpu: None,
             gpu_failed: false,
+            monitor_index: ctx.flags.1,
         })
     }
 
     fn on_frame_arrived(
         &mut self,
         frame: &mut Frame,
-        _capture_control: InternalCaptureControl,
+        capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        // a monitor switch was requested: end this session so the outer loop
+        // can start a new one on the right monitor
+        if self.shared.lock().unwrap().monitor_index != self.monitor_index {
+            capture_control.stop();
+            return Ok(());
+        }
         let width = frame.width();
         let height = frame.height();
         if !self.got_first {
@@ -199,11 +207,15 @@ impl GraphicsCaptureApiHandler for Handler {
 }
 
 fn run(
+    monitor_index: usize,
     cursor: CursorCaptureSettings,
     border: DrawBorderSettings,
     shared: Shared,
 ) -> Result<(), String> {
-    let monitor = Monitor::primary().map_err(|e| format!("no primary monitor: {e:?}"))?;
+    // windows-capture indices are 1-based; fall back to the primary monitor
+    let monitor = Monitor::from_index(monitor_index + 1)
+        .or_else(|_| Monitor::primary())
+        .map_err(|e| format!("no monitor: {e:?}"))?;
     let settings = Settings::new(
         monitor,
         cursor,
@@ -212,19 +224,32 @@ fn run(
         MinimumUpdateIntervalSettings::Default,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
-        shared,
+        (shared, monitor_index),
     );
     // Blocking: runs the capture message loop on this thread until closed.
     Handler::start(settings).map_err(|e| format!("{e:?}"))
 }
 
-/// Spawn a background thread that captures the primary monitor forever.
+/// Spawn a background thread that captures the selected monitor forever,
+/// restarting the session whenever shared.monitor_index changes.
 /// Preferred: cursor excluded (the real cursor is OS-drawn on top of the
 /// overlay, so a captured copy would ghost near the hole) and no yellow
 /// capture-indicator border. Both toggles are unsupported on some older
 /// Windows 10 builds, so fall back progressively if starting fails.
 pub fn start(shared: Shared) {
-    std::thread::spawn(move || {
+    std::thread::spawn(move || loop {
+        let idx = {
+            // fresh session: reset frame + GPU-sharing negotiation state
+            let mut g = shared.lock().unwrap();
+            g.width = 0;
+            g.height = 0;
+            g.data = Vec::new();
+            g.gpu_index = None;
+            g.gpu_handles = None;
+            g.gpu_disabled = false;
+            g.epoch = g.epoch.wrapping_add(1);
+            g.monitor_index
+        };
         let attempts: [(CursorCaptureSettings, DrawBorderSettings, &str); 3] = [
             (
                 CursorCaptureSettings::WithoutCursor,
@@ -242,13 +267,25 @@ pub fn start(shared: Shared) {
                 "default settings",
             ),
         ];
+        let mut ran = false;
         for (cursor, border, label) in attempts {
-            eprintln!("capture: starting ({label})");
-            match run(cursor, border, shared.clone()) {
-                Ok(()) => return, // session ran and closed normally
+            eprintln!("capture: starting monitor {} ({label})", idx + 1);
+            match run(idx, cursor, border, shared.clone()) {
+                Ok(()) => {
+                    ran = true;
+                    break;
+                }
                 Err(e) => eprintln!("capture: {label} failed: {e}"),
             }
         }
-        eprintln!("capture: all attempts failed");
+        if !ran {
+            eprintln!("capture: all attempts failed");
+            return;
+        }
+        // if the target monitor is unchanged, the session ended for real
+        if shared.lock().unwrap().monitor_index == idx {
+            eprintln!("capture: session ended");
+            return;
+        }
     });
 }

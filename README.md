@@ -25,6 +25,11 @@ freed from Ghostty and Claude Code.
 - **A real overlay** - fullscreen, always-on-top, click-through; your apps keep
   working underneath while the hole warps them. The overlay excludes itself
   from capture, so there is no mirror-feedback
+- **Place it anywhere** - hold Ctrl+Shift and the hole follows your mouse;
+  release to pin it in place. Tray: Position, or `pin_x`/`pin_y` in the
+  config file; Auto drift resumes the wandering
+- **Multi-monitor** - pick which monitor the hole lives on from the tray
+  (or `monitor` in the config file); the capture follows along
 - **Screensaver mode** - optionally appear only after N minutes without
   keyboard/mouse input, swelling out of nothing, and vanish on the first
   input (tray: Screensaver, or `idle_minutes` in the config file)

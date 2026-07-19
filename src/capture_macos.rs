@@ -17,7 +17,7 @@ use crate::Shared;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
+use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, Message};
 use objc2_core_media::CMSampleBuffer;
 use objc2_core_video::{
     CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
@@ -111,7 +111,15 @@ pub fn start(shared: Shared) {
         }
         let content = unsafe { &*content };
         let displays = unsafe { content.displays() };
-        let Some(display) = displays.firstObject() else {
+        // display selection follows the startup monitor choice; live monitor
+        // switching is not wired up on macOS yet
+        let idx = shared.lock().unwrap().monitor_index;
+        let display = if idx < displays.count() {
+            Some(unsafe { displays.objectAtIndex_unchecked(idx) }.retain())
+        } else {
+            displays.firstObject()
+        };
+        let Some(display) = display else {
             eprintln!("capture: no displays available");
             return;
         };

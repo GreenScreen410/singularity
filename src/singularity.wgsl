@@ -39,10 +39,11 @@ struct Uniforms {
     expo: f32,          // tonemap exposure
     star: f32,          // lensed starfield gain
     hole_radius: f32,   // shadow radius, fraction of screen height
-    drift_speed: f32,   // wander speed multiplier
-    drift_x: f32,       // horizontal wander amplitude (0..0.5)
-    drift_y: f32,       // vertical wander amplitude   (0..0.5)
-    _pad: vec2<f32>,
+    center_x: f32,      // hole centre in uv, computed on the CPU
+    center_y: f32,      // (drift, pinned or follow-the-cursor placement)
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var desktop_tex: texture_2d<f32>;
@@ -68,8 +69,8 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VSOut {
 }
 
 // ---------------------------------------------------------------- tunables --
-// Disk look, size and drift come from the uniforms (tray menu / config file);
-// only the hole-independent knobs stay compile-time.
+// Disk look, size and centre come from the uniforms (tray menu / config
+// file / placement hotkey); only the hole-independent knobs stay compile-time.
 const LENS_DEPTH: f32    = 13.0;   // hole-to-sky-plane distance in r_s - bigger = bends harder
 const N_STEPS: i32       = 48;     // geodesic steps per pixel (perf dial)
 const B_CRIT: f32        = 2.5980762; // critical impact parameter, r_s
@@ -86,12 +87,6 @@ fn rot(v: vec2<f32>, a: f32) -> vec2<f32> {
     let c = cos(a);
     let s = sin(a);
     return vec2<f32>(c * v.x - s * v.y, s * v.x + c * v.y);
-}
-
-// unit Lissajous wander: incommensurate sines, never visibly repeats
-fn lissa(t: f32) -> vec2<f32> {
-    return vec2<f32>(0.75 * sin(t * 0.37) + 0.25 * sin(t * 0.83 + 1.0),
-                     0.70 * sin(t * 0.54 + 2.1) + 0.30 * sin(t * 1.07));
 }
 
 fn hash21(pin: vec2<f32>) -> f32 {
@@ -169,9 +164,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let rout = max(u.outer, rin + 0.5);
     let rh   = u.hole_radius;            // shadow radius in screen units
 
-    // slow self-drift (Lissajous, never repeats)
-    let center = vec2<f32>(0.5, 0.5)
-               + lissa(t * 0.12 * u.drift_speed) * vec2<f32>(u.drift_x, u.drift_y);
+    // hole centre computed on the CPU (drift / pinned / follow-the-cursor)
+    let center = vec2<f32>(u.center_x, u.center_y);
 
     // aspect-corrected frame centered on the hole (y in screen heights)
     let p    = (uv - center) * vec2<f32>(aspect, 1.0);
