@@ -37,6 +37,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 # wgpu-hal 23 speaks windows 0.58; only used to hand resources across the
 # hal boundary (same COM ABI, bridged by raw pointer)

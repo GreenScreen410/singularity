@@ -25,6 +25,8 @@ mod capture;
 mod capture;
 #[cfg(windows)]
 mod gpu_share;
+#[cfg(windows)]
+mod screenshot_fix;
 
 /// Number of shared GPU textures in the zero-copy ring (Windows).
 pub const GPU_BUFFERS: usize = 3;
@@ -56,14 +58,14 @@ pub type Shared = Arc<Mutex<SharedFrame>>;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    resolution: [f32; 2],
-    time: f32,
-    has_desktop: f32,
-    look: [f32; 14], // temp incl roll inner outer opac dopp beam gain contr wind speed expo star
-    hole_radius: f32,
-    center: [f32; 2], // hole centre in uv, computed on the CPU
-    _pad: [f32; 3],
+pub struct Uniforms {
+    pub resolution: [f32; 2],
+    pub time: f32,
+    pub has_desktop: f32,
+    pub look: [f32; 14], // temp incl roll inner outer opac dopp beam gain contr wind speed expo star
+    pub hole_radius: f32,
+    pub center: [f32; 2], // hole centre in uv, computed on the CPU
+    pub _pad: [f32; 3],
 }
 
 const DEFAULT_SIZE: f32 = 0.09; // shadow radius, fraction of screen height
@@ -104,7 +106,8 @@ struct FileCfg {
     check_updates: Option<u32>,
     pin_x: Option<f32>,
     pin_y: Option<f32>,
-    monitor: Option<usize>, // 1-based in the file
+    monitor: Option<usize>, // 0 = all, otherwise 1-based
+    fix_screenshots: Option<u32>,
 }
 
 fn parse_config(text: &str) -> FileCfg {
@@ -125,6 +128,7 @@ fn parse_config(text: &str) -> FileCfg {
             "pin_x" => cfg.pin_x = v.parse().ok(),
             "pin_y" => cfg.pin_y = v.parse().ok(),
             "monitor" => cfg.monitor = v.parse().ok(),
+            "fix_screenshots" => cfg.fix_screenshots = v.parse().ok(),
             _ => {}
         }
     }
@@ -175,6 +179,12 @@ const DEFAULT_CONFIG: &str = "\
 # Monitors: 0 = roam across all of them (default), N = stay on monitor N.
 # Also in the tray menu.
 #monitor = 0
+
+# Print Screen produces a hole-less image (the overlay must exclude itself
+# from capture, or it would capture itself forever). When this is on, a
+# full-screen screenshot landing on the clipboard right after PrtScn gets
+# the hole composited back in. 0 = leave the clipboard alone.
+#fix_screenshots = 1
 ";
 
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -699,12 +709,6 @@ impl State {
 
     /// Per-pane update: ingest the newest capture frame and write uniforms.
     fn update_pane(&mut self, i: usize) {
-        let look = self.current_look();
-        let radius_ref = self.hole_radius * self.appear_factor();
-        let time = self.start.elapsed().as_secs_f32();
-        let center_px = self.center_px;
-        let primary_h = self.primary_h;
-
         // zero-copy maintenance wants disjoint borrows; do it via free fns
         #[cfg(windows)]
         {
@@ -715,6 +719,7 @@ impl State {
             pane_gpu_maintenance(device, layout, sampler, pane);
         }
 
+        {
         let queue = &self.queue;
         let device = &self.device;
         let layout = &self.bind_group_layout;
@@ -774,25 +779,35 @@ impl State {
             );
             pane.has_desktop = true;
         }
+        } // release the pane borrow before the shared-self uniform math
 
-        let u = Uniforms {
+        let u = self.pane_uniforms(i);
+        self.queue
+            .write_buffer(&self.panes[i].uniform_buf, 0, bytemuck::bytes_of(&u));
+    }
+
+    /// The uniform block for one pane at this instant. Also used by the
+    /// screenshot compositor, which renders the same hole over a clipboard
+    /// image instead of the live capture.
+    fn pane_uniforms(&self, i: usize) -> Uniforms {
+        let pane = &self.panes[i];
+        Uniforms {
             resolution: [pane.config.width as f32, pane.config.height as f32],
-            time,
+            time: self.start.elapsed().as_secs_f32(),
             has_desktop: if pane.has_desktop { 1.0 } else { 0.0 },
-            look,
+            look: self.current_look(),
             // the hole keeps one physical size everywhere: radius is relative
             // to the primary monitor's height, rescaled per pane
-            hole_radius: radius_ref
-                * (primary_h as f32 / pane.mon_size.height.max(1) as f32),
+            hole_radius: self.hole_radius * self.appear_factor()
+                * (self.primary_h as f32 / pane.mon_size.height.max(1) as f32),
             center: [
-                ((center_px[0] - pane.mon_pos.x as f64) / pane.mon_size.width.max(1) as f64)
-                    as f32,
-                ((center_px[1] - pane.mon_pos.y as f64) / pane.mon_size.height.max(1) as f64)
-                    as f32,
+                ((self.center_px[0] - pane.mon_pos.x as f64)
+                    / pane.mon_size.width.max(1) as f64) as f32,
+                ((self.center_px[1] - pane.mon_pos.y as f64)
+                    / pane.mon_size.height.max(1) as f64) as f32,
             ],
             _pad: [0.0; 3],
-        };
-        queue.write_buffer(&pane.uniform_buf, 0, bytemuck::bytes_of(&u));
+        }
     }
 
     fn render_pane(&mut self, i: usize) -> Result<(), wgpu::SurfaceError> {
@@ -1429,6 +1444,35 @@ fn main() {
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused))]
     let mut tray_pinned_ui = state.pinned_px.is_some();
 
+    // PrtScn clipboard fix state
+    #[cfg(windows)]
+    let mut fix_screenshots = startup_cfg.fix_screenshots.unwrap_or(1) != 0;
+    #[cfg(windows)]
+    let mut last_prtscn: Option<std::time::Instant> = None;
+    #[cfg(windows)]
+    let mut last_clip_seq: u32 = unsafe {
+        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+    };
+    // full virtual desktop bounds (all monitors), what PrtScn captures
+    #[cfg(windows)]
+    let (virtual_origin, virtual_size) = {
+        let mut min = (i32::MAX, i32::MAX);
+        let mut max = (i32::MIN, i32::MIN);
+        for m in &monitors {
+            let p = m.position();
+            let s = m.size();
+            min.0 = min.0.min(p.x);
+            min.1 = min.1.min(p.y);
+            max.0 = max.0.max(p.x + s.width as i32);
+            max.1 = max.1.max(p.y + s.height as i32);
+        }
+        if monitors.is_empty() {
+            ((0, 0), (1920u32, 1080u32))
+        } else {
+            (min, ((max.0 - min.0) as u32, (max.1 - min.1) as u32))
+        }
+    };
+
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
         .run(move |event, elwt| match event {
@@ -1524,6 +1568,66 @@ fn main() {
                         let pane = &mut state.panes[i];
                         pane.window.set_visible(false);
                         pane.visible = false;
+                    }
+                }
+
+                // PrtScn clipboard fix: when a full-screen screenshot lands
+                // on the clipboard shortly after PrtScn, composite the hole
+                // into it (the capture exclusion keeps it out of the original)
+                #[cfg(windows)]
+                {
+                    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+                    use windows::Win32::UI::Input::KeyboardAndMouse::{
+                        GetAsyncKeyState, VK_SNAPSHOT,
+                    };
+                    let down = unsafe { GetAsyncKeyState(VK_SNAPSHOT.0 as i32) } as u16;
+                    if down & 0x8001 != 0 {
+                        last_prtscn = Some(std::time::Instant::now());
+                    }
+                    let seq = unsafe { GetClipboardSequenceNumber() };
+                    if seq != last_clip_seq {
+                        last_clip_seq = seq;
+                        let recent =
+                            last_prtscn.is_some_and(|t| t.elapsed().as_secs_f32() < 10.0);
+                        eprintln!(
+                            "screenshot: clipboard changed (prtscn recent: {recent})"
+                        );
+                        if fix_screenshots && recent && state.panes.iter().any(|p| p.visible) {
+                            let shots: Vec<screenshot_fix::PaneShot> = state
+                                .panes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, p)| p.visible)
+                                .map(|(i, p)| screenshot_fix::PaneShot {
+                                    pos: (p.mon_pos.x, p.mon_pos.y),
+                                    size: (p.mon_size.width, p.mon_size.height),
+                                    uniforms: state.pane_uniforms(i),
+                                })
+                                .collect();
+                            match screenshot_fix::try_fix(
+                                &state.device,
+                                &state.queue,
+                                &state.pipeline,
+                                &state.bind_group_layout,
+                                &state.sampler,
+                                state.format,
+                                virtual_origin,
+                                virtual_size,
+                                &shots,
+                            ) {
+                                Ok(true) => {
+                                    eprintln!(
+                                        "screenshot: hole composited into the clipboard image"
+                                    );
+                                    // our own write bumped the sequence
+                                    last_clip_seq =
+                                        unsafe { GetClipboardSequenceNumber() };
+                                    last_prtscn = None;
+                                }
+                                Ok(false) => {}
+                                Err(e) => eprintln!("screenshot: fix failed: {e}"),
+                            }
+                        }
                     }
                 }
 
@@ -1680,6 +1784,11 @@ fn main() {
                                             ]),
                                             _ => None,
                                         };
+                                    }
+                                    #[cfg(windows)]
+                                    if cfg.fix_screenshots != prev_cfg.fix_screenshots {
+                                        fix_screenshots =
+                                            cfg.fix_screenshots.unwrap_or(1) != 0;
                                     }
                                     if cfg.monitor != prev_cfg.monitor {
                                         let sel = sel_from_cfg(cfg.monitor);

@@ -115,14 +115,18 @@ In screensaver mode the renderer is fully idle until the hole appears. It is
 still a continuous visual effect though, so expect some battery cost while
 the hole is on screen.
 
-## Why is it missing from my screenshots?
+## Screenshots and the capture exclusion
 
 The overlay excludes itself from screen capture: it captures the desktop
 itself, and without that exclusion it would see its own output and
-collapse into an infinite mirror. Windows applies the exclusion to still
-screenshots (Print Screen, Snipping Tool), so the hole will not appear in
-them. Screen recording does pick it up (the demo above is a plain screen
-recording), so use video when you want to show it off.
+collapse into an infinite mirror. That would normally keep the hole out
+of your screenshots, so Singularity fixes them instead: when a
+full-screen screenshot lands on the clipboard right after Print Screen,
+the hole is composited back into the image before you paste it. Region
+snips and files saved to disk are deliberately left untouched, and
+`fix_screenshots = 0` in the config file turns the whole thing off.
+Screen recording picks the overlay up as-is (the demo above is a plain
+screen recording).
 
 ## A note on Windows SmartScreen
 
