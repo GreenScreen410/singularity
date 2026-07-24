@@ -572,6 +572,9 @@ impl State {
         monitors: &[winit::monitor::MonitorHandle],
         selection: Option<usize>,
     ) {
+        let old_roam_pos = self.roam_pos;
+        let old_roam_size = self.roam_size;
+        let old_pin = self.pinned_px;
         for p in &self.panes {
             // sentinel: tells that pane's capture thread to shut down
             p.shared.lock().unwrap().monitor_index = usize::MAX;
@@ -580,10 +583,19 @@ impl State {
         let shells = make_shells(&self.instance, target, monitors, selection);
         self.finish_panes(shells);
         self.update_roam_box();
-        self.center_px = [
+        self.pinned_px = old_pin.map(|pin| {
+            remap_point(
+                pin,
+                old_roam_pos,
+                old_roam_size,
+                self.roam_pos,
+                self.roam_size,
+            )
+        });
+        self.center_px = self.pinned_px.unwrap_or([
             self.roam_pos[0] + self.roam_size[0] * 0.5,
             self.roam_pos[1] + self.roam_size[1] * 0.5,
-        ];
+        ]);
     }
 
     /// Current look: smoothstep crossfade from look_from to look_to.
@@ -1075,6 +1087,49 @@ fn lissa(t: f32) -> [f32; 2] {
         0.75 * (t * 0.37).sin() + 0.25 * (t * 0.83 + 1.0).sin(),
         0.70 * (t * 0.54 + 2.1).sin() + 0.30 * (t * 1.07).sin(),
     ]
+}
+
+/// Preserve a point's relative position when its containing box changes.
+fn remap_point(
+    point: [f64; 2],
+    from_pos: [f64; 2],
+    from_size: [f64; 2],
+    to_pos: [f64; 2],
+    to_size: [f64; 2],
+) -> [f64; 2] {
+    std::array::from_fn(|i| {
+        let t = ((point[i] - from_pos[i]) / from_size[i].max(1.0)).clamp(0.0, 1.0);
+        to_pos[i] + to_size[i].max(1.0) * t
+    })
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::remap_point;
+
+    #[test]
+    fn remaps_and_clamps_points_between_monitor_boxes() {
+        assert_eq!(
+            remap_point(
+                [1920.0, 540.0],
+                [0.0, 0.0],
+                [3840.0, 1080.0],
+                [0.0, 0.0],
+                [2560.0, 1440.0],
+            ),
+            [1280.0, 720.0]
+        );
+        assert_eq!(
+            remap_point(
+                [5000.0, -100.0],
+                [0.0, 0.0],
+                [3840.0, 1080.0],
+                [-1920.0, 0.0],
+                [1920.0, 1080.0],
+            ),
+            [0.0, 0.0]
+        );
+    }
 }
 
 /// Placement hotkey: both Ctrl and Shift held, observed globally without
