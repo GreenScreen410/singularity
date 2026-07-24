@@ -96,11 +96,15 @@ impl Output {
     }
 }
 
-/// Start capturing the primary display. ScreenCaptureKit delivers frames on
-/// its own dispatch queue, so this returns immediately.
-pub fn start(shared: Shared, monitor_index: usize) {
-    shared.lock().unwrap().monitor_index = monitor_index;
-    eprintln!("capture: requesting shareable content (screen-recording permission)");
+/// Start capturing a specific CoreGraphics display at its native pixel size.
+/// ScreenCaptureKit delivers frames on its own dispatch queue, so this returns
+/// immediately.
+pub fn start(shared: Shared, display_id: u32, pixel_width: u32, pixel_height: u32) {
+    shared.lock().unwrap().monitor_index = display_id as usize;
+    eprintln!(
+        "capture: requesting display {display_id} at {pixel_width}x{pixel_height} \
+         (screen-recording permission)"
+    );
     let handler = RcBlock::new(move |content: *mut SCShareableContent, error: *mut NSError| {
         if content.is_null() {
             let msg = unsafe { error.as_ref().map(|e| e.localizedDescription()) };
@@ -112,16 +116,20 @@ pub fn start(shared: Shared, monitor_index: usize) {
         }
         let content = unsafe { &*content };
         let displays = unsafe { content.displays() };
-        // display selection follows the startup monitor choice; live monitor
-        // switching is not wired up on macOS yet
-        let idx = shared.lock().unwrap().monitor_index;
-        let display = if idx < displays.count() {
-            Some(unsafe { displays.objectAtIndex_unchecked(idx) }.retain())
-        } else {
-            displays.firstObject()
-        };
+        // SCShareableContent does not promise the same ordering as
+        // CGGetActiveDisplayList (which winit uses), so match the stable
+        // CGDirectDisplayID rather than indexing both arrays in parallel.
+        let requested_id = shared.lock().unwrap().monitor_index as u32;
+        let mut display = None;
+        for idx in 0..displays.count() {
+            let candidate = unsafe { displays.objectAtIndex_unchecked(idx) };
+            if unsafe { candidate.displayID() } == requested_id {
+                display = Some(candidate.retain());
+                break;
+            }
+        }
         let Some(display) = display else {
-            eprintln!("capture: no displays available");
+            eprintln!("capture: display {requested_id} is no longer available");
             return;
         };
 
@@ -135,11 +143,11 @@ pub fn start(shared: Shared, monitor_index: usize) {
             );
 
             let config = SCStreamConfiguration::new();
-            // SCDisplay reports points; on Retina the stream still delivers
-            // a full-resolution buffer scaled to this size. Good enough for
-            // a lensed background - revisit with pointPixelScale if blurry.
-            config.setWidth(display.width() as usize);
-            config.setHeight(display.height() as usize);
+            // SCDisplay width/height are points. Asking for those values on a
+            // Retina panel silently halves each pixel dimension, so use the
+            // native physical size supplied by winit instead.
+            config.setWidth(pixel_width as usize);
+            config.setHeight(pixel_height as usize);
             config.setPixelFormat(FORMAT_32BGRA);
             // like the Windows path: the real cursor is drawn above the
             // overlay anyway, a captured copy would only ghost near the hole

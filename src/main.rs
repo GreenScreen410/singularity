@@ -10,10 +10,11 @@
 
 use std::sync::{Arc, Mutex};
 use winit::{
-    dpi::{PhysicalPosition, PhysicalSize},
+    dpi::{PhysicalPosition, PhysicalSize, Position, Size},
     event::{ElementState, Event, KeyEvent, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
     keyboard::{Key, NamedKey},
+    monitor::MonitorHandle,
     window::{Window, WindowBuilder, WindowLevel},
 };
 
@@ -55,6 +56,18 @@ pub struct SharedFrame {
     pub epoch: u64,
 }
 pub type Shared = Arc<Mutex<SharedFrame>>;
+
+/// A monitor rectangle in the platform's coherent virtual-desktop space.
+///
+/// Windows uses physical pixels for this space. macOS uses points because
+/// CoreGraphics display origins and cursor positions are expressed in points;
+/// multiplying every display origin by its own scale factor produces gaps and
+/// overlaps on mixed-Retina setups.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesktopRect {
+    pos: [f64; 2],
+    size: [f64; 2],
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -216,8 +229,13 @@ struct Pane {
     config: wgpu::SurfaceConfiguration,
     #[cfg_attr(not(windows), allow(dead_code))]
     mon_index: usize,
+    #[cfg(windows)]
     mon_pos: PhysicalPosition<i32>,
+    #[cfg(windows)]
     mon_size: PhysicalSize<u32>,
+    window_pos: Position,
+    window_size: Size,
+    desktop_rect: DesktopRect,
     shared: Shared,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -260,8 +278,8 @@ struct State {
     spin: f32,         // Kerr spin 0..0.99
     idle_minutes: f32, // 0 = always visible; >0 = appear after this much idle
     appear_start: Option<std::time::Instant>, // grow-in animation anchor
-    // hole placement in virtual-desktop pixels: the roam box is the bounding
-    // box of the selected monitors, the centre is smoothed toward its target
+    // hole placement in the platform's virtual-desktop coordinate space:
+    // physical pixels on Windows, points on macOS
     roam_pos: [f64; 2],
     roam_size: [f64; 2],
     primary_h: f64, // hole size reference so it stays constant across panes
@@ -424,9 +442,11 @@ impl State {
             cache: None,
         });
 
-        let primary_h = monitors
-            .first()
-            .map(|m| m.size().height as f64)
+        let primary_h = target
+            .primary_monitor()
+            .as_ref()
+            .or_else(|| monitors.first())
+            .map(|m| monitor_desktop_rect(m).size[1])
             .unwrap_or(1080.0);
         let mut state = State {
             instance,
@@ -475,8 +495,14 @@ impl State {
                 window,
                 surface,
                 mon_index,
+                #[cfg(windows)]
                 mon_pos,
                 mon_size,
+                window_pos,
+                window_size,
+                desktop_rect,
+                #[cfg(target_os = "macos")]
+                display_id,
             } = shell;
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -509,8 +535,10 @@ impl State {
                 monitor_index: mon_index,
                 ..Default::default()
             }));
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(windows)]
             capture::start(shared.clone(), mon_index);
+            #[cfg(target_os = "macos")]
+            capture::start(shared.clone(), display_id, mon_size.width, mon_size.height);
 
             // overlay styles only after the swapchain exists (layered-window
             // rule); the window is still hidden at this point
@@ -523,8 +551,13 @@ impl State {
                 surface,
                 config,
                 mon_index,
+                #[cfg(windows)]
                 mon_pos,
+                #[cfg(windows)]
                 mon_size,
+                window_pos,
+                window_size,
+                desktop_rect,
                 shared,
                 uniform_buf,
                 bind_group,
@@ -546,15 +579,15 @@ impl State {
         }
     }
 
-    /// The union bounding box of the selected monitors, in virtual pixels.
+    /// The union bounding box of the selected monitors in desktop coordinates.
     fn update_roam_box(&mut self) {
         let mut min = [f64::MAX, f64::MAX];
         let mut max = [f64::MIN, f64::MIN];
         for p in &self.panes {
-            min[0] = min[0].min(p.mon_pos.x as f64);
-            min[1] = min[1].min(p.mon_pos.y as f64);
-            max[0] = max[0].max(p.mon_pos.x as f64 + p.mon_size.width as f64);
-            max[1] = max[1].max(p.mon_pos.y as f64 + p.mon_size.height as f64);
+            min[0] = min[0].min(p.desktop_rect.pos[0]);
+            min[1] = min[1].min(p.desktop_rect.pos[1]);
+            max[0] = max[0].max(p.desktop_rect.pos[0] + p.desktop_rect.size[0]);
+            max[1] = max[1].max(p.desktop_rect.pos[1] + p.desktop_rect.size[1]);
         }
         if self.panes.is_empty() {
             min = [0.0, 0.0];
@@ -597,7 +630,7 @@ impl State {
         out
     }
 
-    /// Global cursor position in virtual-desktop pixels.
+    /// Global cursor position in the platform's virtual-desktop coordinates.
     #[cfg(windows)]
     fn cursor_px(&self) -> Option<[f64; 2]> {
         use windows::Win32::Foundation::POINT;
@@ -630,12 +663,7 @@ impl State {
             }
             let loc = CGEventGetLocation(ev); // global, top-left origin, points
             CFRelease(ev);
-            let scale = self
-                .panes
-                .first()
-                .map(|p| p.window.scale_factor())
-                .unwrap_or(1.0);
-            Some([loc.x * scale, loc.y * scale])
+            Some([loc.x, loc.y])
         }
     }
 
@@ -810,13 +838,14 @@ impl State {
             look: self.current_look(),
             // the hole keeps one physical size everywhere: radius is relative
             // to the primary monitor's height, rescaled per pane
-            hole_radius: self.hole_radius * self.appear_factor()
-                * (self.primary_h as f32 / pane.mon_size.height.max(1) as f32),
+            hole_radius: self.hole_radius
+                * self.appear_factor()
+                * (self.primary_h as f32 / pane.desktop_rect.size[1].max(1.0) as f32),
             center: [
-                ((self.center_px[0] - pane.mon_pos.x as f64)
-                    / pane.mon_size.width.max(1) as f64) as f32,
-                ((self.center_px[1] - pane.mon_pos.y as f64)
-                    / pane.mon_size.height.max(1) as f64) as f32,
+                ((self.center_px[0] - pane.desktop_rect.pos[0])
+                    / pane.desktop_rect.size[0].max(1.0)) as f32,
+                ((self.center_px[1] - pane.desktop_rect.pos[1])
+                    / pane.desktop_rect.size[1].max(1.0)) as f32,
             ],
             spin: self.spin,
             _pad: [0.0; 2],
@@ -878,8 +907,44 @@ struct Shell {
     surface: wgpu::Surface<'static>,
     #[cfg_attr(not(windows), allow(dead_code))]
     mon_index: usize,
+    #[cfg(windows)]
     mon_pos: PhysicalPosition<i32>,
     mon_size: PhysicalSize<u32>,
+    window_pos: Position,
+    window_size: Size,
+    desktop_rect: DesktopRect,
+    #[cfg(target_os = "macos")]
+    display_id: u32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn scaled_desktop_rect(
+    pos: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    scale_factor: f64,
+) -> DesktopRect {
+    let pos = pos.to_logical::<f64>(scale_factor);
+    let size = size.to_logical::<f64>(scale_factor);
+    DesktopRect {
+        pos: [pos.x, pos.y],
+        size: [size.width, size.height],
+    }
+}
+
+fn monitor_desktop_rect(monitor: &MonitorHandle) -> DesktopRect {
+    #[cfg(target_os = "macos")]
+    {
+        scaled_desktop_rect(monitor.position(), monitor.size(), monitor.scale_factor())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let pos = monitor.position();
+        let size = monitor.size();
+        DesktopRect {
+            pos: [pos.x as f64, pos.y as f64],
+            size: [size.width as f64, size.height as f64],
+        }
+    }
 }
 
 /// Manual borderless "fullscreen" per monitor: undecorated topmost windows
@@ -899,14 +964,24 @@ fn make_shells(
     let mut shells = Vec::new();
     for i in indices {
         let m = &monitors[i];
-        let (pos, size) = (m.position(), m.size());
+        let size = m.size();
+        #[cfg(not(target_os = "macos"))]
+        let pos = m.position();
+        let desktop_rect = monitor_desktop_rect(m);
+        #[cfg(target_os = "macos")]
+        let (window_pos, window_size) = (
+            Position::Logical(desktop_rect.pos.into()),
+            Size::Logical(desktop_rect.size.into()),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (window_pos, window_size) = (Position::Physical(pos), Size::Physical(size));
         let window = Arc::new(
             WindowBuilder::new()
                 .with_title("Singularity")
                 .with_decorations(false)
                 .with_window_level(WindowLevel::AlwaysOnTop)
-                .with_inner_size(size)
-                .with_position(pos)
+                .with_inner_size(window_size)
+                .with_position(window_pos)
                 .with_visible(false) // hidden until its first frame is ready
                 .build(target)
                 .unwrap(),
@@ -916,8 +991,17 @@ fn make_shells(
             window,
             surface,
             mon_index: i,
+            #[cfg(windows)]
             mon_pos: pos,
             mon_size: size,
+            window_pos,
+            window_size,
+            desktop_rect,
+            #[cfg(target_os = "macos")]
+            display_id: {
+                use winit::platform::macos::MonitorHandleExtMacOS;
+                m.native_id()
+            },
         });
     }
     shells
@@ -1637,8 +1721,8 @@ fn main() {
                         let pane = &mut state.panes[i];
                         pane.window.set_visible(true);
                         // re-assert overlay traits after the hidden start
-                        pane.window.set_outer_position(pane.mon_pos);
-                        let _ = pane.window.request_inner_size(pane.mon_size);
+                        pane.window.set_outer_position(pane.window_pos);
+                        let _ = pane.window.request_inner_size(pane.window_size);
                         pane.window.set_window_level(WindowLevel::AlwaysOnTop);
                         pane.visible = true;
                     } else if !show && state.panes[i].visible {
@@ -1933,4 +2017,38 @@ fn main() {
             _ => {}
         })
         .unwrap();
+}
+
+#[cfg(test)]
+mod monitor_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_dpi_monitors_share_the_core_graphics_point_space() {
+        let external = scaled_desktop_rect(
+            PhysicalPosition::new(0, 0),
+            PhysicalSize::new(2560, 1440),
+            1.0,
+        );
+        let retina = scaled_desktop_rect(
+            PhysicalPosition::new(-3024, 0),
+            PhysicalSize::new(3024, 1964),
+            2.0,
+        );
+
+        assert_eq!(
+            external,
+            DesktopRect {
+                pos: [0.0, 0.0],
+                size: [2560.0, 1440.0],
+            }
+        );
+        assert_eq!(
+            retina,
+            DesktopRect {
+                pos: [-1512.0, 0.0],
+                size: [1512.0, 982.0],
+            }
+        );
+    }
 }
