@@ -13,7 +13,7 @@
 // are left alone (silently editing user files is not our place).
 
 use crate::Uniforms;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -118,24 +118,36 @@ fn clipboard_dib() -> Option<Vec<u8>> {
     None
 }
 
-fn write_clipboard_dib(bytes: &[u8]) -> Result<(), String> {
+fn write_clipboard_dib(owner: isize, bytes: &[u8]) -> Result<(), String> {
     unsafe {
-        OpenClipboard(None).map_err(|e| format!("OpenClipboard: {e}"))?;
+        // Prepare the replacement before touching the clipboard. Once
+        // EmptyClipboard succeeds, the old screenshot is gone.
+        let hg = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
+            .map_err(|e| format!("GlobalAlloc: {e}"))?;
+        let ptr = GlobalLock(hg) as *mut u8;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hg));
+            return Err("GlobalLock failed".into());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        let _ = GlobalUnlock(hg);
+
+        if let Err(e) = OpenClipboard(Some(HWND(owner as *mut _))) {
+            let _ = GlobalFree(Some(hg));
+            return Err(format!("OpenClipboard: {e}"));
+        }
         let res = (|| {
             EmptyClipboard().map_err(|e| format!("EmptyClipboard: {e}"))?;
-            let hg = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
-                .map_err(|e| format!("GlobalAlloc: {e}"))?;
-            let ptr = GlobalLock(hg) as *mut u8;
-            if ptr.is_null() {
-                return Err("GlobalLock failed".into());
-            }
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-            let _ = GlobalUnlock(hg);
             SetClipboardData(CF_DIB, Some(HANDLE(hg.0)))
                 .map_err(|e| format!("SetClipboardData: {e}"))?;
             Ok(())
         })();
         let _ = CloseClipboard();
+        if res.is_err() {
+            // Ownership transfers to the system only after SetClipboardData
+            // succeeds.
+            let _ = GlobalFree(Some(hg));
+        }
         res
     }
 }
@@ -343,6 +355,7 @@ pub fn try_fix(
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     format: wgpu::TextureFormat,
+    clipboard_owner: isize,
     virtual_origin: (i32, i32),
     virtual_size: (u32, u32),
     shots: &[PaneShot],
@@ -386,6 +399,6 @@ pub fn try_fix(
             virtual_origin.1,
         );
     }
-    write_clipboard_dib(&dib.bytes)?;
+    write_clipboard_dib(clipboard_owner, &dib.bytes)?;
     Ok(true)
 }

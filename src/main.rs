@@ -1028,22 +1028,29 @@ fn make_bind_group(
 /// back into the desktop capture). Minimal user32 FFI to avoid pinning a
 /// specific `windows` crate version.
 #[cfg(windows)]
-fn set_capture_exclusion(window: &Window, on: bool) {
+fn window_hwnd(window: &Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn set_capture_exclusion(window: &Window, on: bool) {
     const WDA_NONE: u32 = 0x0;
     const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
     #[link(name = "user32")]
     extern "system" {
         fn SetWindowDisplayAffinity(hwnd: isize, dw_affinity: u32) -> i32;
     }
-    if let Ok(handle) = window.window_handle() {
-        if let RawWindowHandle::Win32(h) = handle.as_raw() {
-            unsafe {
-                SetWindowDisplayAffinity(
-                    h.hwnd.get(),
-                    if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE },
-                );
-            }
+    if let Some(hwnd) = window_hwnd(window) {
+        unsafe {
+            SetWindowDisplayAffinity(
+                hwnd,
+                if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE },
+            );
         }
     }
 }
@@ -1668,6 +1675,11 @@ fn main() {
                         let recent =
                             last_prtscn.is_some_and(|t| t.elapsed().as_secs_f32() < 10.0);
                         if fix_screenshots && recent && state.panes.iter().any(|p| p.visible) {
+                            let clipboard_owner = state
+                                .panes
+                                .iter()
+                                .find(|p| p.visible)
+                                .and_then(|p| window_hwnd(&p.window));
                             let shots: Vec<screenshot_fix::PaneShot> = state
                                 .panes
                                 .iter()
@@ -1687,17 +1699,23 @@ fn main() {
                                     sh.uniforms.hole_radius
                                 );
                             }
-                            match screenshot_fix::try_fix(
-                                &state.device,
-                                &state.queue,
-                                &state.pipeline,
-                                &state.bind_group_layout,
-                                &state.sampler,
-                                state.format,
-                                virtual_origin,
-                                virtual_size,
-                                &shots,
-                            ) {
+                            let result = clipboard_owner
+                                .ok_or_else(|| "screenshot: no owner window".to_string())
+                                .and_then(|owner| {
+                                    screenshot_fix::try_fix(
+                                        &state.device,
+                                        &state.queue,
+                                        &state.pipeline,
+                                        &state.bind_group_layout,
+                                        &state.sampler,
+                                        state.format,
+                                        owner,
+                                        virtual_origin,
+                                        virtual_size,
+                                        &shots,
+                                    )
+                                });
+                            match result {
                                 Ok(true) => {
                                     eprintln!(
                                         "screenshot: hole composited into the clipboard image"
