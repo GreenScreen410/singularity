@@ -69,6 +69,8 @@ install `mingw-w64`, then `cargo build --release --target x86_64-pc-windows-gnu`
 
 ### macOS (UNTESTED - help wanted)
 
+Requires macOS 12.3 or newer.
+
 The macOS port (ScreenCaptureKit capture + `NSWindowSharingNone` self-exclusion
 + menu-bar presets) is structurally complete and kept type-checked via
 `cargo check --target aarch64-apple-darwin`, but has never run on real
